@@ -50,6 +50,30 @@ Tauri 2(Rust core + WebView 前端 + 原生 JS + JSON 数据驱动 + 可配置 A
             └── 1.mp3
 ```
 
+## 安装(macOS)
+
+到 [Releases](https://github.com/gebilaoman/Attune/releases) 下载 `Attune_x.x.x_universal.dmg`(Intel + Apple Silicon 通用),打开后把 **Attune** 拖进「应用程序」。
+
+⚠️ **首次打开会被 Gatekeeper 拦**:本应用只做了更新器签名、**未做 Apple 公证**(个人自用),所以 macOS 会提示「Attune 已损坏,无法打开」或「无法验证开发者」。二选一解除:
+
+- **右键打开**:在「应用程序」里右键 Attune → 打开 → 再点「打开」。若提示"已损坏"用不了,改用下面命令。
+- **去掉隔离属性**(推荐,一劳永逸):
+  ```bash
+  xattr -cr /Applications/Attune.app
+  ```
+  之后正常双击即可。
+
+### 运行前置
+
+- **逐句音频**:用 edge-tts(免费)或本地合成时,需要 `python3` + edge-tts:
+  ```bash
+  pip install --index-url https://pypi.org/simple/ edge-tts
+  ```
+  纯走云端厂商(智谱 GLM 等)则不需要本地依赖。
+- 首次启动在**设置**里:选一个文件夹当 vault、配 AI 提供商与 API Key、选 TTS 音色。
+
+> 应用内「检查更新」依赖 Release 里的 `latest.json` + `.app.tar.gz(.sig)`,用同一把更新器私钥验证。
+
 ## 开发
 
 ```bash
