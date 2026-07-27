@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Attune · 英语听读</title>
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+    <div id="app">
+
+        <!-- 标题栏(可拖拽) -->
+        <header class="titlebar">
+            <div class="brand">
+                <img class="brand-mark" src="/attune-logo.svg" alt="">
+                <strong>Attune</strong>
+                <span class="brand-sub" id="vaultLabel">未选择库</span>
+            </div>
+            <div class="titlebar-actions">
+                <button id="newDocBtn" class="ghost-button" type="button">＋ 新建文档</button>
+                <button id="settingsBtn" class="icon-button" type="button" title="设置">⚙</button>
+            </div>
+        </header>
+
+        <div class="body">
+            <!-- 侧栏:文件夹树 -->
+            <aside class="sidebar">
+                <div class="sidebar-head">
+                    <span>文档库</span>
+                    <div class="sidebar-head-actions">
+                        <button id="newFolderBtn" class="icon-button sm" title="新建文件夹"><svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round"><path d="M2 4.5h3.5L7 6.5h7V13a1 1 0 0 1-1 1H3a1 1 0 0 1-1-1z"/><line x1="8" y1="8" x2="8" y2="11.5"/><line x1="6.3" y1="9.75" x2="9.7" y2="9.75"/></svg></button>
+                        <button id="refreshBtn" class="icon-button sm" title="刷新">↻</button>
+                    </div>
+                </div>
+                <input type="text" id="newFolderInput" class="new-folder-input" placeholder="文件夹名(可嵌套),回车创建 / Esc 取消" hidden>
+                <nav id="tree" class="tree">
+                    <div class="tree-empty">选择库后,导入的文档会出现在这里</div>
+                </nav>
+                <button id="openVaultBtn" class="sidebar-foot ghost-button sm" type="button">在访达中打开库</button>
+            </aside>
+
+            <!-- 阅读区 -->
+            <main class="reader">
+                <div id="emptyState" class="empty-state">
+                    <img class="empty-mark" src="/attune-logo.svg" alt="">
+                    <h2>逐句精听,听懂真实英文</h2>
+                    <p>粘贴一段英文(Slack 聊天 / 会议纪要 / 博客 / 文档),AI 帮你清理、切句、翻译,再生成逐句音频,反复精听。</p>
+                    <button id="emptyNewDocBtn" class="primary-button" type="button">＋ 新建文档</button>
+                </div>
+
+                <div id="readerView" class="reader-view" hidden>
+                    <div class="reader-head">
+                        <div class="reader-title-wrap">
+                            <h1 id="noteTitle">—</h1>
+                            <div class="reader-meta" id="noteMeta"></div>
+                        </div>
+                        <div class="reader-actions">
+                            <button id="editRawBtn" class="ghost-button sm" type="button" title="编辑原文,可重新 AI 转化">✎ 编辑原文</button>
+                            <button id="playAllBtn" class="ghost-button sm" type="button">▷ 听整篇</button>
+                            <button id="genAudioBtn" class="ghost-button sm" type="button" title="把整篇按当前音色缓存到本地,便于离线;不缓存也能边听边实时合成">预缓存当前音色</button>
+                            <button id="revealNoteBtn" class="icon-button" title="在访达中显示">📂</button>
+                        </div>
+                    </div>
+                    <div id="blocks" class="blocks"></div>
+                </div>
+
+                <!-- 编辑器(预处理 + 就地编辑) -->
+                <div id="editorView" class="editor-view" hidden>
+                    <div class="editor-head">
+                        <input type="text" id="editTitle" placeholder="文档标题">
+                    </div>
+                    <!-- 顶部操作栏(转化/重转在顶部,符合"上面操作、下面内容")-->
+                    <div class="editor-top">
+                        <span id="editorStatus" class="field-note" style="margin:0; white-space:pre-wrap;"></span>
+                        <span class="spacer"></span>
+                        <button id="toRawBtn" class="ghost-button sm" type="button" title="回到原文整体重跑 AI(会覆盖当前句块)" hidden>↺ 回原文重转</button>
+                        <button id="convertBtn" class="primary-button sm" type="button" hidden>AI 转化并听读</button>
+                    </div>
+
+                    <!-- 就地句块编辑器(已转化) -->
+                    <div id="structEditor" class="struct-editor" hidden>
+                        <div id="structBlocks" class="struct-blocks"></div>
+                    </div>
+
+                    <!-- 原文编辑器(草稿 / 回原文重转) -->
+                    <div id="rawEditor" class="raw-editor">
+                        <textarea id="editRaw" class="edit-raw" placeholder="把原始英文粘到这里(Slack / 会议 / 博客 / 文档)…&#10;先手动删掉噪音、调整段落,再点顶部「AI 转化」清理+切句+翻译。&#10;自动保存;"></textarea>
+                    </div>
+
+                    <!-- 底部:返回阅读(已转化时) -->
+                    <div class="editor-bottom">
+                        <button id="editorBackBtn" class="ghost-button sm" type="button" hidden>← 返回阅读</button>
+                    </div>
+                </div>
+            </main>
+        </div>
+
+        <!-- 传输栏(播放器式:主栏极简,次要控件收进 ⋯ 面板)-->
+        <footer class="transport" id="transport" hidden>
+            <div class="transport-main">
+                <div class="transport-now" id="nowPlaying">—</div>
+                <div class="transport-trio">
+                    <button id="prevBtn" class="icon-button" title="上一句">⏮</button>
+                    <button id="playBtn" class="play-button" title="播放/暂停">▶</button>
+                    <button id="nextBtn" class="icon-button" title="下一句">⏭</button>
+                </div>
+                <div class="transport-right">
+                    <label class="ctl hot" title="热开关:读名字=先念说话人姓名再念正文;关掉只念正文(即时生效,各版本各自缓存)">
+                        <input type="checkbox" id="playReadSpeakerChk">
+                        <span>读名字</span>
+                    </label>
+                    <button id="masteredBtn" class="ghost-button sm" title="标记当前句为已掌握">懂了 ✓</button>
+                    <button id="transportMoreBtn" class="icon-button" title="更多播放选项">⋯</button>
+                </div>
+            </div>
+            <div class="transport-extra" id="transportExtra" hidden>
+                <div class="loop-mode" id="loopMode" title="播放循环方式">
+                    <button data-mode="seq" class="active">顺序</button>
+                    <button data-mode="all">整篇</button>
+                    <button data-mode="one">单句</button>
+                </div>
+                <label class="ctl" title="精听时跳过已掌握的句">
+                    <input type="checkbox" id="skipMasteredChk" checked>
+                    <span>跳过已懂</span>
+                </label>
+                <label class="ctl" title="随时切换音色:下一句起立即生效,每个音色各自缓存">
+                    <span>音色</span>
+                    <select id="voiceSel"></select>
+                </label>
+                <label class="ctl">
+                    <span>语速</span>
+                    <select id="rateSel">
+                        <option value="0.5">0.5×</option>
+                        <option value="0.6">0.6×</option>
+                        <option value="0.75" selected>0.75×</option>
+                        <option value="0.85">0.85×</option>
+                        <option value="1">1.0×</option>
+                        <option value="1.25">1.25×</option>
+                    </select>
+                </label>
+                <label class="ctl">
+                    <span>句间隔</span>
+                    <input type="range" id="gapRange" min="0" max="3000" step="100" value="0">
+                    <span class="num" id="gapVal">0s</span>
+                </label>
+                <label class="ctl">
+                    <input type="checkbox" id="showZhChk">
+                    <span>显示中文</span>
+                </label>
+            </div>
+        </footer>
+
+        <!-- 设置页(整页,左侧标签 + 右侧面板) -->
+        <main id="settingsView" class="settings-shell" hidden>
+            <aside class="settings-sidebar">
+                <div class="settings-sidebar-header"><strong>设置</strong></div>
+                <nav class="settings-tabs" aria-label="settings">
+                    <button class="settings-tab active" type="button" data-settings-tab="basic">基本</button>
+                    <button class="settings-tab" type="button" data-settings-tab="models">模型配置</button>
+                    <button class="settings-tab" type="button" data-settings-tab="tts">语音合成</button>
+                    <button class="settings-tab" type="button" data-settings-tab="about">关于</button>
+                </nav>
+            </aside>
+            <div class="settings-content">
+                <div class="settings-content-toolbar">
+                    <button id="backToReaderBtn" class="settings-close-button" type="button">← 返回</button>
+                    <button id="saveSettingsBtn" class="primary-button sm" type="button">保存</button>
+                </div>
+
+                <section class="settings-panel active" data-settings-panel="basic">
+                    <div class="settings-panel-header">
+                        <div><h1>基本</h1><p>库目录与配置文件位置。</p></div>
+                    </div>
+                    <div class="settings-form">
+                        <div class="form-group">
+                            <label>库目录(vault)—— 文档 JSON 与音频都放这里</label>
+                            <div class="model-control">
+                                <input type="text" id="vaultPath" placeholder="点击右侧选择文件夹…">
+                                <button id="pickVaultBtn" type="button">选择…</button>
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label>配置文件</label>
+                            <p class="field-note" id="configPathHint"></p>
+                            <button id="openDataDirBtn" class="ghost-button sm" type="button" style="margin-top:6px;">↗ 打开配置目录</button>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="settings-panel" data-settings-panel="models">
+                    <div class="settings-panel-header">
+                        <div><h1>模型配置</h1><p>AI 提供商、API 地址与模型(用于清理 / 翻译 / 即查)。</p></div>
+                    </div>
+                    <div class="settings-form">
+                        <div class="form-group">
+                            <label>AI 提供商</label>
+                            <select id="providerSel">
+                                <option value="zhipu">智谱 GLM</option>
+                                <option value="deepseek">DeepSeek</option>
+                                <option value="openai">OpenAI</option>
+                                <option value="openrouter">OpenRouter</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>Base URL</label>
+                            <input type="text" id="baseUrlInput">
+                        </div>
+                        <div class="form-group">
+                            <label>模型</label>
+                            <div class="model-control">
+                                <select id="modelInput"></select>
+                                <button id="fetchModelsBtn" type="button">刷新模型列表</button>
+                            </div>
+                            <p id="modelStatus" class="field-note"></p>
+                        </div>
+                        <div class="form-group">
+                            <label>API Key</label>
+                            <input type="password" id="apiKeyInput" placeholder="保存后不再回显;留空不改">
+                        </div>
+                    </div>
+                </section>
+
+                <section class="settings-panel" data-settings-panel="tts">
+                    <div class="settings-panel-header">
+                        <div><h1>语音合成</h1><p>句级音频的 TTS 厂商、音色与凭证(独立于模型配置;音色可自行增删)。</p></div>
+                    </div>
+                    <div class="settings-form">
+                        <div class="form-group">
+                            <label>TTS 厂商</label>
+                            <select id="ttsProviderSel">
+                                <option value="edge">edge-tts(微软,免费,免配置)</option>
+                                <option value="zhipu">智谱 GLM-TTS</option>
+                                <!-- 火山/阿里云暂未调通,先禁用;调通后去掉 disabled 即可恢复 -->
+                                <option value="doubao" disabled>火山引擎(豆包)— 暂不可用</option>
+                                <option value="aliyun" disabled>阿里云 NLS — 暂不可用</option>
+                            </select>
+                        </div>
+                        <div class="form-group">
+                            <label>音色 voice(来自配置,可自行追加)</label>
+                            <div class="model-control">
+                                <select id="ttsVoice" style="flex:1;"></select>
+                                <button id="ttsVoiceDelBtn" class="ghost-button sm" type="button" title="删除当前音色">删除</button>
+                            </div>
+                            <div class="model-control" style="margin-top:6px;">
+                                <input type="text" id="ttsVoiceAddId" placeholder="音色 id(如 BV123_streaming)">
+                                <input type="text" id="ttsVoiceAddName" placeholder="显示名(可空)">
+                                <button id="ttsVoiceAddBtn" class="ghost-button sm" type="button">＋ 添加</button>
+                            </div>
+                            <p id="ttsVoiceHint" class="field-note"></p>
+                        </div>
+                        <div class="form-group">
+                            <label>语速(edge: -8%;智谱/豆包/阿里云也支持 -8% 或 0.92)</label>
+                            <input type="text" id="ttsRate" placeholder="-8%">
+                        </div>
+                        <div class="form-group">
+                            <label class="checkbox-row"><input type="checkbox" id="ttsReadSpeaker" checked> <span>朗读说话人姓名(关掉则只读正文,不再念名字+停顿)</span></label>
+                        </div>
+                        <div class="form-group tts-only tts-zhipu">
+                            <label>智谱 TTS API Key(独立配置,与模型配置互不影响)</label>
+                            <input type="password" id="ttsZhipuKey" placeholder="请输入智谱 TTS API Key">
+                        </div>
+                        <div class="form-group tts-only tts-doubao">
+                            <label>火山 API Key(控制台 > API Key 管理,api-key- 开头)</label>
+                            <input type="password" id="ttsDoubaoKey" placeholder="api-key-...">
+                        </div>
+                        <div class="form-group tts-only tts-doubao">
+                            <label>火山 Resource Id(模型版本,默认 seed-tts-2.0)</label>
+                            <input type="text" id="ttsDoubaoResource" placeholder="seed-tts-2.0">
+                        </div>
+                        <div class="form-group tts-only tts-aliyun">
+                            <label>阿里云 AppKey</label>
+                            <input type="text" id="ttsAliyunAppKey">
+                        </div>
+                        <div class="form-group tts-only tts-aliyun">
+                            <label>阿里云 AccessKey ID</label>
+                            <input type="text" id="ttsAliyunAkId">
+                        </div>
+                        <div class="form-group tts-only tts-aliyun">
+                            <label>阿里云 AccessKey Secret</label>
+                            <input type="password" id="ttsAliyunAkSecret">
+                        </div>
+                        <div class="form-group tts-only tts-aliyun">
+                            <label>地域 region</label>
+                            <input type="text" id="ttsAliyunRegion" placeholder="cn-shanghai">
+                        </div>
+                        <div class="form-group">
+                            <label>试听当前音色</label>
+                            <div class="model-control">
+                                <button id="testTtsBtn" class="ghost-button sm" type="button">▶ 试听</button>
+                            </div>
+                            <p id="ttsTestStatus" class="field-note" style="margin-top:6px; white-space:pre-wrap; word-break:break-word;"></p>
+                            <p class="field-note">直接试听会自动保存当前配置(含新增音色/凭证),合成一句样本并播放。出错时上方红字显示后端真实错误。阿里云需先装 nls SDK(见脚本注释)。</p>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="settings-panel" data-settings-panel="about">
+                    <div class="settings-panel-header">
+                        <div><h1>关于 Attune</h1><p>应用信息与系统详情。</p></div>
+                    </div>
+                    <div class="about-content">
+                        <div class="about-section">
+                            <h2>应用信息</h2>
+                            <div class="about-info">
+                                <div class="about-item"><span class="about-label">当前版本</span><span id="aboutVersion" class="about-value">正在加载…</span></div>
+                                <div class="about-item"><span class="about-label">构建类型</span><span id="aboutBuildType" class="about-value">-</span></div>
+                                <div class="about-item"><span class="about-label">系统平台</span><span id="aboutPlatform" class="about-value">-</span></div>
+                                <div class="about-item"><span class="about-label">系统版本</span><span id="aboutOsVersion" class="about-value">-</span></div>
+                            </div>
+                        </div>
+                        <div class="about-section">
+                            <h2>更新检查</h2>
+                            <div class="about-info">
+                                <div class="about-item"><span class="about-label">最新版本</span><span id="latestVersion" class="about-value">未检查</span></div>
+                                <div class="about-item"><span class="about-label">更新状态</span><span id="updateStatus" class="about-value">-</span></div>
+                            </div>
+                            <div class="about-actions">
+                                <button id="checkUpdateBtn" type="button" class="ghost-button sm">检查更新</button>
+                                <button id="downloadUpdateBtn" type="button" class="primary-button sm" hidden>下载并安装</button>
+                            </div>
+                        </div>
+                        <div class="about-section">
+                            <h2>相关链接</h2>
+                            <div class="about-links">
+                                <a href="https://github.com/gebilaoman/Attune" target="_blank" rel="noopener noreferrer">GitHub 仓库</a>
+                                <a href="https://github.com/gebilaoman/Attune/issues" target="_blank" rel="noopener noreferrer">报告问题</a>
+                            </div>
+                        </div>
+                    </div>
+                </section>
+            </div>
+        </main>
+    </div>
+
+    <!-- 导入对话框 -->
+    <div id="importModal" class="modal" aria-hidden="true">
+        <div class="modal-backdrop" data-close></div>
+        <section class="modal-card wide" role="dialog" aria-modal="true">
+            <header class="modal-head">
+                <h2>导入文本</h2>
+                <button class="icon-button" type="button" data-close>×</button>
+            </header>
+            <div class="modal-body">
+                <div class="field">
+                    <label>原始文本(任意来源:Slack / 会议 / 博客 / 文档)</label>
+                    <textarea id="rawText" rows="10" placeholder="把英文原文粘贴到这里…&#10;AI 会自动:滤噪音 → 保结构 → 切句标注 → 逐句翻译"></textarea>
+                </div>
+                <div class="field-row">
+                    <div class="field">
+                        <label>标题(留空让 AI 起)</label>
+                        <input type="text" id="importTitle" placeholder="如:SDK 集成会议纪要">
+                    </div>
+                    <div class="field">
+                        <label>放进文件夹(库内相对路径,可嵌套,可留空)</label>
+                        <input type="text" id="importFolder" placeholder="如:工作/SDK集成">
+                    </div>
+                </div>
+                <div class="field">
+                    <label>来源备注(可选)</label>
+                    <input type="text" id="importSource" placeholder="如:Slack #sdk-channel">
+                </div>
+                <div id="importStatus" class="import-status" hidden></div>
+            </div>
+            <footer class="modal-foot">
+                <button class="ghost-button" type="button" data-close>取消</button>
+                <button id="doImportBtn" class="primary-button" type="button">清理并导入</button>
+            </footer>
+        </section>
+    </div>
+
+    <!-- 即查浮层 -->
+    <div id="wordPopover" class="word-popover" hidden>
+        <div class="word-popover-head">
+            <strong id="wordTitle">—</strong>
+            <span class="word-star" title="收藏(本版本未实现)" data-star>★</span>
+            <button class="icon-button sm" type="button" id="wordClose">×</button>
+        </div>
+        <div class="word-popover-body" id="wordBody">查询中…</div>
+    </div>
+
+    <audio id="audio" preload="auto"></audio>
+
+    <!-- 应用内确认弹窗(不依赖原生 confirm,后者在 WKWebView 下不弹框) -->
+    <div id="confirmModal" class="modal-overlay" hidden>
+        <div class="modal-box">
+            <div class="modal-msg" id="confirmMsg"></div>
+            <div class="modal-acts">
+                <button id="confirmCancel" class="ghost-button" type="button">取消</button>
+                <button id="confirmOk" class="ghost-button" type="button">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <script type="module" src="/main.js"></script>
+</body>
+</html>

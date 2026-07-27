@@ -1,0 +1,51 @@
+# Rust
+/target/
+**/target/
+# 注意：应用类项目应提交 Cargo.lock（可复现构建），故不忽略。
+
+# Node
+node_modules/
+**/node_modules/
+
+# 前端构建产物（由 vite/tauri 生成）
+gui/dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# CodeGraph
+.codegraph/
+
+# Debug
+*.pdb
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+*.bak
+*.cache
+
+# Test artifacts (optional - remove if you want to commit test files)
+test_ai.sh
+test_ai_api.rs
+test_ai_prompt
+test_ai_prompt.rs
+
+# Plans (optional - remove if you want to commit planning documents)
+v0.3-gui-plan.md
+
+# Secrets and environment
+.env.secret
+*.secret
+**/private-key.pem

@@ -1,0 +1,11 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "主窗口所需的核心权限（应用自定义命令不受 ACL 限制，无需在此列出）。shell:default 用于 spawn 子进程跑 TTS 预处理脚本、以及打开外链。",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "updater:default",
+    "shell:default"
+  ]
+}
