@@ -367,8 +367,21 @@ def main():
     media_dir = media_root / note_id / vkey
     media_dir.mkdir(parents=True, exist_ok=True)
 
+    # 整篇预缓存:先数出需要音频的句总数(read_aloud 且有文本),用于进度显示。
+    total_targets = 0
+    if not args.only:
+        for s in iter_sentences(note.get("blocks", [])):
+            if s.get("id") and s.get("read_aloud", True) and tts_text(s, read_speaker):
+                total_targets += 1
+
     total = done = skipped_exist = skipped_noread = failed = 0
     only_out = None
+
+    def emit_progress():
+        # 机械可读进度行,给 Rust 解析后转发前端(已处理数=新生成+已存在+失败)。
+        if not args.only:
+            print(f"@PROGRESS {done + skipped_exist + failed} {total_targets}", flush=True)
+
     for s in iter_sentences(note.get("blocks", [])):
         sid = s.get("id")
         if not sid:
@@ -391,6 +404,7 @@ def main():
             # 已存在也要把正确的相对路径写回 JSON(可能从别的厂商换过来 mp3↔wav)
             s["audio"] = rel_audio
             skipped_exist += 1
+            emit_progress()
             continue
         try:
             synth(text, out)
@@ -398,13 +412,12 @@ def main():
             done += 1
             if args.only:
                 only_out = str(out.resolve())
-            if done % 5 == 0:
-                print(f"  …已生成 {done} 句", flush=True)
         except Exception as e:
             failed += 1
             sys.stderr.write(f"  ✗ {sid}: {e}\n")
             if out.exists():
                 out.unlink()
+        emit_progress()
 
     # 仅「整篇」模式把 audio 路径写回 JSON(作为默认音色指针)。
     # --only 是实时/单句按需合成:只填该音色的缓存文件,不改 JSON,避免篡改默认指针。

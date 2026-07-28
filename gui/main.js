@@ -11,6 +11,27 @@ const tauriCore = window.__TAURI__?.core;
 const invoke = tauriCore?.invoke?.bind(tauriCore) ?? (async (cmd) => {
     throw new Error(`浏览器预览模式不支持原生命令:${cmd}(请用 tauri dev 运行)`);
 });
+const tauriEvent = window.__TAURI__?.event;
+
+// 预缓存:监听后端 precache-progress 事件显示「x/y 句」,invoke 结束后取消监听。
+async function invokeGenerateAudio(rel, onProgress) {
+    let unlisten = null;
+    try {
+        if (tauriEvent?.listen && onProgress) {
+            unlisten = await tauriEvent.listen('precache-progress', (e) => {
+                const p = e.payload || {};
+                onProgress(p.done ?? 0, p.total ?? 0);
+            });
+        }
+        return await invoke('generate_audio', {
+            relPath: rel,
+            voice: state.currentVoice || null,
+            readSpeaker: state.readSpeaker,
+        });
+    } finally {
+        if (unlisten) unlisten();
+    }
+}
 
 const $ = (id) => document.getElementById(id);
 
@@ -54,10 +75,13 @@ const state = {
     gapMs: 0,
     showZh: false,
     playing: false,
+    synthing: false,      // 是否正在实时合成当前句(显示「合成中…」+ 按钮转圈)
     advanceToken: 0,
+    playToken: 0,         // 每次 playIndex 自增:异步合成回来后比对,过期的丢弃(防串音/多点)
     currentVoice: '',     // 当前音色(可听读中途切换);空=用 config 默认
     readSpeaker: true,    // 是否读说话人姓名(热开关);默认跟随 config
     audioCache: new Map(),// `${voice}:${readSpeaker}:${sentenceId}` -> dataURL
+    audioInflight: new Map(), // 同键在途的合成 Promise:多次点击/预取复用一个,不重复起进程
     // 编辑
     forceRaw: false,      // 已转化文档里点「回原文重转」时为 true,强制原文 textarea
     structMode: false,    // 当前是否在句块就地编辑
@@ -405,6 +429,7 @@ async function openNote(rel, opts = {}) {
         const editMode = opts.forceEditor || !hasBlocks;
         setViewMode(editMode);
         setActiveNote(rel); // 就地高亮,不重渲染树
+        if (!editMode) warmFirstSentences(); // 开篇预热:后台先合成前几句,按播放即秒开
     } catch (e) {
         alert('打开失败:' + e);
     }
@@ -423,8 +448,9 @@ function setViewMode(editMode) {
     state.structMode = useStruct;
     $('structEditor').hidden = !useStruct;
     $('rawEditor').hidden = !!useStruct;
-    // 顶部按钮:句块模式→回原文重转 + 返回阅读;原文模式→AI 转化
-    $('toRawBtn').hidden = !useStruct;
+    // 顶部按钮:句块模式→「更多」(整篇重转收里面)+ 返回阅读;原文模式→AI 转化
+    $('editorMoreBtn').hidden = !useStruct;  // 「更多」仅句块模式出现
+    $('toRawBtn').hidden = true;             // 回原文重转默认藏进「更多」,点 ⋯ 才显示
     $('editorBackBtn').hidden = !useStruct; // 句块模式(已转化)才显示返回阅读
     $('convertBtn').hidden = !!useStruct;
     if (useStruct) fillStructEditor();
@@ -448,7 +474,7 @@ function fillRawEditor() {
 function fillStructEditor() {
     state.editBlocks = JSON.parse(JSON.stringify(state.note?.blocks || []));
     renderStructBlocks();
-    setStructStatus('直接改英文 / 中文 / 说话人 / 朗读,自动保存,不经 AI。改英文或朗读的句,其音频会失效。', '');
+    setStructStatus('直接改英文即可(自动保存,不经 AI)。改过的句音频会失效,听读前重新合成。删句用 ×;说话人 / 朗读点 ⋯。', '');
 }
 
 function setStructStatus(text, kind) {
@@ -480,9 +506,17 @@ function renderStructBlocks() {
     });
 }
 
+// 编辑卡片瘦身:核心只有「改英文 + 删句」。中文由 AI 自动产出,不再手编辑;
+// 说话人 / 朗读属于偶尔才用,收进卡片「⋯」里,默认折叠。
 function structCard(s, onDelete) {
     const card = el('div', 'sedit-card');
-    const top = el('div', 'sedit-top');
+
+    const en = document.createElement('textarea');
+    en.className = 'sedit-en'; en.value = s.en || ''; en.rows = 1;
+    en.addEventListener('input', () => { s.en = en.value; autoGrow(en); scheduleSave(); });
+
+    // 次要设置(说话人 / 朗读):默认收起,点「⋯」展开
+    const detail = el('div', 'sedit-detail'); detail.hidden = true;
     const speaker = document.createElement('input');
     speaker.className = 'speaker'; speaker.value = s.speaker || ''; speaker.placeholder = '说话人(可空)';
     speaker.addEventListener('input', () => { s.speaker = speaker.value; scheduleSave(); });
@@ -490,19 +524,22 @@ function structCard(s, onDelete) {
     ra.innerHTML = '<input type="checkbox"><span>朗读</span>';
     const raChk = ra.querySelector('input'); raChk.checked = !!s.read_aloud;
     raChk.addEventListener('change', () => { s.read_aloud = raChk.checked; scheduleSave(); });
-    const del = el('button', 'icon-button sm'); del.textContent = '×'; del.title = '删除该句';
+    detail.append(speaker, ra);
+
+    const tools = el('div', 'sedit-tools');
+    const moreBtn = el('button', 'icon-button sm'); moreBtn.textContent = '⋯'; moreBtn.title = '说话人 / 朗读';
+    moreBtn.addEventListener('click', () => {
+        detail.hidden = !detail.hidden;
+        moreBtn.classList.toggle('on', !detail.hidden);
+    });
+    const del = el('button', 'icon-button sm del'); del.textContent = '×'; del.title = '删除该句';
     del.addEventListener('click', onDelete);
-    top.append(speaker, ra, el('span', 'spacer'), del);
+    tools.append(moreBtn, del);
 
-    const en = document.createElement('textarea');
-    en.className = 'sedit-en'; en.value = s.en || ''; en.rows = 1;
-    en.addEventListener('input', () => { s.en = en.value; autoGrow(en); scheduleSave(); });
+    const main = el('div', 'sedit-main');
+    main.append(en, tools);
 
-    const zh = document.createElement('input');
-    zh.className = 'sedit-zh'; zh.value = s.zh || ''; zh.placeholder = '中文翻译';
-    zh.addEventListener('input', () => { s.zh = zh.value; scheduleSave(); });
-
-    card.append(top, en, zh);
+    card.append(main, detail);
     setTimeout(() => autoGrow(en), 0);
     return card;
 }
@@ -789,17 +826,39 @@ async function playIndex(i) {
         scheduleAdvance(0);
         return;
     }
+    const token = ++state.playToken; // 本次播放请求;合成回来后比对,过期则丢弃
     try {
+        const cached = state.audioCache.has(audioKey(s.id));
+        if (!cached) setSynthing(true, s);      // 未命中→显示「合成中…」,给用户即时反馈
         const url = await ensureAudio(s);
+        if (token !== state.playToken) return;  // 期间用户切了句/停了,丢弃这次结果
+        setSynthing(false);
         audio.src = url;
         audio.playbackRate = state.speed;
         await audio.play();
+        if (token !== state.playToken) return;
         state.playing = true;
         setPlayBtn(true);
         preloadNext();
     } catch (e) {
-        setNowPlaying(`播放失败:${e}`);
-        scheduleAdvance(0);
+        if (token !== state.playToken) return;
+        setSynthing(false);
+        setNowPlaying(`合成失败:${e}`);
+        scheduleAdvance(600);
+    }
+}
+
+// 合成中状态:播放键转圈 + 现在播放区标「合成中…」。给用户明确反馈,避免「点了没反应」。
+function setSynthing(on, s) {
+    state.synthing = on;
+    const btn = $('playBtn');
+    btn.classList.toggle('loading', on);
+    if (on) {
+        btn.innerHTML = '<span class="btn-spinner"></span>';
+        const cur = s || state.queue[state.qIndex];
+        if (cur) setNowPlaying(`${nowPlayingText(cur)}　·　合成中…`);
+    } else {
+        btn.textContent = state.playing ? '⏸' : '▶';
     }
 }
 
@@ -827,20 +886,49 @@ function switchVoice(voice) {
 async function ensureAudio(s) {
     const key = audioKey(s.id);
     if (state.audioCache.has(key)) return state.audioCache.get(key);
-    const url = await invoke('play_sentence', {
+    // 同一句已在合成中(点了多次 / 预取撞上):复用同一个 Promise,不再起第二个 python 进程。
+    if (state.audioInflight.has(key)) return state.audioInflight.get(key);
+    const p = invoke('play_sentence', {
         relPath: state.noteRel,
         sentenceId: s.id,
         voice: state.currentVoice || null,
         readSpeaker: state.readSpeaker,
+    }).then((url) => {
+        state.audioCache.set(key, url);
+        state.audioInflight.delete(key);
+        return url;
+    }).catch((e) => {
+        state.audioInflight.delete(key);
+        throw e;
     });
-    state.audioCache.set(key, url);
-    return url;
+    state.audioInflight.set(key, p);
+    return p;
 }
 
+// 预取深度:提前合成后面几句,用「正在播这句」的时间盖住「合成后面几句」的网络延迟。
+const PREFETCH_AHEAD = 3;
 function preloadNext() {
-    const next = state.queue[state.qIndex + 1];
-    if (!next || !next.read_aloud) return;
-    if (!state.audioCache.has(audioKey(next.id))) ensureAudio(next).catch(() => {});
+    for (let k = 1; k <= PREFETCH_AHEAD; k++) {
+        const nx = state.queue[state.qIndex + k];
+        if (!nx) break;
+        if (!nx.read_aloud) continue;
+        const key = audioKey(nx.id);
+        if (!state.audioCache.has(key) && !state.audioInflight.has(key)) {
+            ensureAudio(nx).catch(() => {});
+        }
+    }
+}
+
+// 开篇预热:打开文档时后台先合成前几句,按下播放即可秒开(每篇只热一次)。
+function warmFirstSentences(n = 2) {
+    if (!state.noteRel || !state.note) return;
+    const readable = allSentences(state.note).filter((s) => s.read_aloud).slice(0, n);
+    for (const s of readable) {
+        const key = audioKey(s.id);
+        if (!state.audioCache.has(key) && !state.audioInflight.has(key)) {
+            ensureAudio(s).catch(() => {});
+        }
+    }
 }
 
 function scheduleAdvance(delayMs) {
@@ -866,7 +954,9 @@ function advance() {
 
 function stopPlayback() {
     state.advanceToken++; // 取消挂起的 advance
+    state.playToken++;    // 作废在途合成:回来后 token 不符,不会自播
     state.playing = false;
+    if (state.synthing) setSynthing(false);
     audio.pause();
     setPlayBtn(false);
     highlightSentence(null);
@@ -874,6 +964,7 @@ function stopPlayback() {
 }
 
 function togglePlayPause() {
+    if (state.synthing) return; // 正在合成:已有反馈(转圈),忽略重复点击,别再起合成
     if (!state.queue.length) {
         if (state.note) playAllDoc();
         return;
@@ -897,11 +988,15 @@ function highlightSentence(id) {
     }
 }
 
-function setNowPlayingFromSentence(s) {
+// 现在播放区的句子文案(说话人 + 译文/原文),不含尾部计数/状态。
+function nowPlayingText(s) {
     const sp = s.speaker ? `<span class="np-speaker">${esc(s.speaker)}</span> ` : '';
     // 朗读时左下角默认显示中文翻译(听英文、看译文对照);没翻译则回退英文原文。
     const text = (s.zh && s.zh.trim()) ? s.zh : s.en;
-    setNowPlaying(`${sp}${esc(text)}　·　${state.qIndex + 1}/${state.queue.length}`);
+    return `${sp}${esc(text)}`;
+}
+function setNowPlayingFromSentence(s) {
+    setNowPlaying(`${nowPlayingText(s)}　·　${state.qIndex + 1}/${state.queue.length}`);
 }
 function setNowPlaying(html) { $('nowPlaying').innerHTML = html; }
 function setPlayBtn(playing) { $('playBtn').textContent = playing ? '⏸' : '▶'; }
@@ -930,8 +1025,12 @@ function bindImport() {
     $('convertBtn').onclick = convertNote;
     // 阅读器「编辑原文」:已转化→句块就地编辑;草稿→原文
     $('editRawBtn').onclick = () => { if (!state.noteRel) return; state.forceRaw = false; setViewMode(true); };
+    // 编辑器「更多」:展开/收起「回原文重转」(整篇重跑,少用)
+    $('editorMoreBtn').onclick = () => { const b = $('toRawBtn'); b.hidden = !b.hidden; };
     // 句块编辑器里「回原文重转」→ 切到原文 textarea
     $('toRawBtn').onclick = () => { state.forceRaw = true; setViewMode(true); };
+    // 末尾 AI 追加
+    $('appendBtn').onclick = appendViaAi;
     // 编辑器底部「返回阅读」
     $('editorBackBtn').onclick = () => setViewMode(false);
     // 自动保存(防抖):原文 textarea + 标题(两态共用)
@@ -1015,13 +1114,38 @@ async function convertNote() {
     }
 }
 
+// 末尾 AI 追加:只对新贴的原文跑 AI(清理→切句→翻译),接到文末。
+// 前面已有的句块 / 音频完全不动(后端 append_via_ai 保证)。
+async function appendViaAi() {
+    if (!state.noteRel) return;
+    if (!state.config?.has_api_key) { alert('请先在设置里配置 AI 模型与 Key'); openSettings(); return; }
+    const raw = $('appendRaw').value.trim();
+    if (!raw) { $('appendRaw').focus(); return; }
+    const status = $('appendStatus');
+    status.className = 'field-note'; status.textContent = 'AI 追加中(清理 → 切句 → 翻译)…';
+    $('appendBtn').disabled = true;
+    try {
+        const note = await invoke('append_via_ai', { relPath: state.noteRel, raw });
+        state.note = note;
+        $('appendRaw').value = '';
+        fillStructEditor();          // 重载 editBlocks + 重渲染(含新句)
+        status.className = 'field-note ok'; status.textContent = '✓ 已追加到文末,可直接听读';
+        refreshTree();
+    } catch (e) {
+        status.className = 'field-note err'; status.textContent = '✗ 追加失败:' + e;
+    } finally {
+        $('appendBtn').disabled = false;
+    }
+}
+
 async function generateAudio(rel) {
     if (!rel) return;
-    const voice = state.currentVoice || '';
     if (!(await confirmDialog('把整篇按当前音色预缓存到本地?(用于离线;已存在的句子跳过)', { okText: '预缓存' }))) return;
     setNowPlaying('预缓存当前音色中…');
     try {
-        const res = await invoke('generate_audio', { relPath: rel, voice: voice || null, readSpeaker: state.readSpeaker });
+        const res = await invokeGenerateAudio(rel, (done, total) => {
+            setNowPlaying(total ? `预缓存当前音色中… ${done}/${total} 句` : '预缓存当前音色中…');
+        });
         await openNote(rel); // 重新加载,刷新 audio_ready
         if (res.missing > 0) {
             setNowPlaying(`已缓存 ${res.generated} 句,还差 ${res.missing} 句(可再点重试补齐)。`);
@@ -1040,7 +1164,9 @@ async function generateAudioAuto(rel) {
     if (!rel) return;
     setNowPlaying('正在预缓存逐句音频…(也可直接点句子开始听,边听边合成)');
     try {
-        await invoke('generate_audio', { relPath: rel, voice: state.currentVoice || null, readSpeaker: state.readSpeaker });
+        await invokeGenerateAudio(rel, (done, total) => {
+            setNowPlaying(total ? `正在预缓存逐句音频… ${done}/${total}(也可直接点句子边听边合成)` : '正在预缓存逐句音频…(也可直接点句子边听边合成)');
+        });
         await openNote(rel); // 刷新 audio_ready + genAudioBtn
         setNowPlaying('音频就绪,点句子或 ▶ 开始听。');
     } catch (e) {

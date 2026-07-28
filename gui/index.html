@@ -74,13 +74,23 @@
                     <div class="editor-top">
                         <span id="editorStatus" class="field-note" style="margin:0; white-space:pre-wrap;"></span>
                         <span class="spacer"></span>
-                        <button id="toRawBtn" class="ghost-button sm" type="button" title="回到原文整体重跑 AI(会覆盖当前句块)" hidden>↺ 回原文重转</button>
+                        <button id="toRawBtn" class="ghost-button sm" type="button" title="回到原文整体重跑 AI(会覆盖当前句块与音频,少用)" hidden>↺ 回原文重转</button>
+                        <button id="editorMoreBtn" class="icon-button" type="button" title="更多(整篇重转)" hidden>⋯</button>
                         <button id="convertBtn" class="primary-button sm" type="button" hidden>AI 转化并听读</button>
                     </div>
 
-                    <!-- 就地句块编辑器(已转化) -->
+                    <!-- 就地句块编辑器(已转化):逐句改英文 / 删句 + 末尾 AI 追加 -->
                     <div id="structEditor" class="struct-editor" hidden>
                         <div id="structBlocks" class="struct-blocks"></div>
+                        <!-- 末尾追加:贴新原文 → AI 增量处理 → 接到文末(不动前面) -->
+                        <div class="append-box">
+                            <textarea id="appendRaw" class="append-raw" placeholder="在末尾追加:把新的英文贴到这里,点「AI 追加」自动清理 + 切句 + 翻译,接到文末(不影响前面已合成的音频)…"></textarea>
+                            <div class="append-actions">
+                                <span id="appendStatus" class="field-note" style="margin:0"></span>
+                                <span class="spacer"></span>
+                                <button id="appendBtn" class="primary-button sm" type="button">AI 追加</button>
+                            </div>
+                        </div>
                     </div>
 
                     <!-- 原文编辑器(草稿 / 回原文重转) -->
@@ -107,6 +117,17 @@
                         <button id="nextBtn" class="icon-button" title="下一句">⏭</button>
                     </div>
                     <div class="transport-right">
+                        <label class="ctl" title="语速(即时生效)">
+                            <span>语速</span>
+                            <select id="rateSel">
+                                <option value="0.5">0.5×</option>
+                                <option value="0.6">0.6×</option>
+                                <option value="0.75" selected>0.75×</option>
+                                <option value="0.85">0.85×</option>
+                                <option value="1">1.0×</option>
+                                <option value="1.25">1.25×</option>
+                            </select>
+                        </label>
                         <label class="ctl hot" title="热开关:读名字=先念说话人姓名再念正文;关掉只念正文(即时生效,各版本各自缓存)">
                             <input type="checkbox" id="playReadSpeakerChk">
                             <span>读名字</span>
@@ -129,17 +150,6 @@
                 <label class="ctl" title="随时切换音色:下一句起立即生效,每个音色各自缓存">
                     <span>音色</span>
                     <select id="voiceSel"></select>
-                </label>
-                <label class="ctl">
-                    <span>语速</span>
-                    <select id="rateSel">
-                        <option value="0.5">0.5×</option>
-                        <option value="0.6">0.6×</option>
-                        <option value="0.75" selected>0.75×</option>
-                        <option value="0.85">0.85×</option>
-                        <option value="1">1.0×</option>
-                        <option value="1.25">1.25×</option>
-                    </select>
                 </label>
                 <label class="ctl">
                     <span>句间隔</span>

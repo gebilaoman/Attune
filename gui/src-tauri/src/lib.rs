@@ -989,17 +989,33 @@ fn enforce_limit(chunks: Vec<String>, limit: usize) -> Vec<String> {
     out
 }
 
-/// 长文分块清理 → 合并(title/tags 取首块,blocks 拼接)。
+/// 长文分块清理 → 合并(title/tags 取首块,blocks 按原顺序拼接)。
+/// 多块【限并发】处理(而非串行):墙钟时间从「各块求和」降到「最慢那块」,长文转化快数倍。
+/// buffered 保序 —— 输出顺序与输入块一致,文档结构不乱。
 async fn clean_text_chunked(
     raw: &str,
     provider: &AIProvider,
 ) -> Result<(String, Vec<String>, Vec<attune_core::Block>), String> {
+    use futures::stream::{self, StreamExt, TryStreamExt};
+    // 同时最多跑几块 AI:兼顾提速与厂商限流。
+    const CONCURRENCY: usize = 4;
+
     let chunks = split_into_chunks(raw);
+    if chunks.is_empty() {
+        return Ok((String::new(), Vec::new(), Vec::new()));
+    }
+    // 先把各块的 future 收进 Vec(具体类型),再交给 stream::iter —— 避免把借用闭包直接
+    // 传给 buffered 触发 HRTB 的「FnOnce is not general enough」编译错误。
+    let futs: Vec<_> = chunks.iter().map(|ch| clean_via_ai(ch, provider)).collect();
+    let payloads: Vec<ImportPayload> = stream::iter(futs)
+        .buffered(CONCURRENCY)
+        .try_collect()
+        .await?;
+
     let mut title = String::new();
     let mut tags: Vec<String> = Vec::new();
     let mut blocks: Vec<attune_core::Block> = Vec::new();
-    for (i, ch) in chunks.iter().enumerate() {
-        let payload = clean_via_ai(ch, provider).await?;
+    for (i, payload) in payloads.into_iter().enumerate() {
         if i == 0 {
             title = payload.title;
             tags = payload.tags;
@@ -1154,6 +1170,77 @@ async fn convert_note(rel_path: String) -> Result<Note, String> {
     Ok(note)
 }
 
+/// 给 blocks 里的句从 start_n 起顺序发 id 与音频路径(用于「末尾追加」,只动这些新块,不碰其余句)。
+fn assign_ids_from(blocks: &mut [attune_core::Block], prefix: &str, start_n: usize) {
+    let mut n = start_n;
+    for block in blocks {
+        match block {
+            attune_core::Block::Paragraph { sentences } => {
+                for s in sentences {
+                    s.id = format!("{}_{}", prefix, n);
+                    s.audio = format!("{}/{}.mp3", prefix, n);
+                    n += 1;
+                }
+            }
+            attune_core::Block::List { items } => {
+                for item in items {
+                    for s in &mut item.sentences {
+                        s.id = format!("{}_{}", prefix, n);
+                        s.audio = format!("{}/{}.mp3", prefix, n);
+                        n += 1;
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// AI 增量追加:只对新贴的原文跑清理→切句→翻译,结果接到现有 blocks 末尾。
+/// 关键:新句从「现有最大序号 +1」发号,**不调用全局 assign_sentence_ids**,既有句 id / 音频不变。
+/// 原文也接到 note.raw 末尾,保证「回原文重转」仍能复现整篇。
+#[tauri::command]
+async fn append_via_ai(rel_path: String, raw: String) -> Result<Note, String> {
+    let raw = raw.trim().to_string();
+    if raw.is_empty() {
+        return Err("追加内容为空".to_string());
+    }
+    let config = load_config();
+    let provider = build_provider(&config)?;
+    let abs = resolve_in_vault(&rel_path, &config)?;
+    let mut note: Note = serde_json::from_str(
+        &fs::read_to_string(&abs).map_err(|e| format!("读取文档失败: {}", e))?,
+    )
+    .map_err(|e| format!("解析文档 JSON 失败: {}", e))?;
+    note.folder = folder_from_rel(&rel_path); // 以磁盘实际位置为准
+
+    // 只清理这段新文本 → 新 blocks(title/tags 忽略:追加不改文档标题/标签)。
+    let (_ai_title, _ai_tags, mut new_blocks) = clean_text_chunked(&raw, &provider).await?;
+
+    // 现有最大句序号:解析每句 id 尾部数字取 max;空文档从 0 起。
+    let mut max_seq = 0usize;
+    for s in note.collect_sentences() {
+        if let Some((_, seq)) = s.id.rsplit_once('_') {
+            if let Ok(n) = seq.parse::<usize>() {
+                if n > max_seq {
+                    max_seq = n;
+                }
+            }
+        }
+    }
+    assign_ids_from(&mut new_blocks, &note.id, max_seq + 1);
+
+    note.blocks.extend(new_blocks);
+    // 原文接上(整篇重转可复现);首段前不留空。
+    if note.raw.trim().is_empty() {
+        note.raw = raw;
+    } else {
+        note.raw = format!("{}\n\n{}", note.raw.trim_end(), raw);
+    }
+    note.converted = true; // 已有句块,归为已转化
+    write_private_json(&abs, &note)?;
+    Ok(note)
+}
+
 // ─────────────────────────── 单句 AI 优化(校对转写错误) ───────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -1295,6 +1382,13 @@ pub struct AudioGenResult {
     pub log: String,
 }
 
+/// 预缓存进度:done=已处理句数,total=需音频的句总数。通过事件 `precache-progress` 推给前端。
+#[derive(Debug, Clone, Serialize)]
+pub struct PrecacheProgress {
+    pub done: usize,
+    pub total: usize,
+}
+
 /// 预处理脚本位置:repo 根的 scripts/tts_generate.py(相对 src-tauri 往上两级)。
 fn tts_script_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../scripts/tts_generate.py")
@@ -1302,11 +1396,13 @@ fn tts_script_path() -> PathBuf {
 
 #[tauri::command]
 async fn generate_audio(
+    app: tauri::AppHandle,
     rel_path: String,
     force: Option<bool>,
     voice: Option<String>,
     read_speaker: Option<bool>,
 ) -> Result<AudioGenResult, String> {
+    use tauri::Emitter;
     let config = load_config();
     let abs = resolve_in_vault(&rel_path, &config)?;
     let script = tts_script_path();
@@ -1333,7 +1429,11 @@ async fn generate_audio(
         }
     }
 
-    let output = std::process::Command::new("python3")
+    // 流式跑脚本:边跑边读 stdout,解析 `@PROGRESS done total` 转发前端(precache-progress),
+    // 其余行汇入日志。这样预缓存能实时显示「x/y 句」。
+    use std::io::{BufRead, BufReader, Read};
+    use std::process::Stdio;
+    let mut child = std::process::Command::new("python3")
         .arg(script)
         .arg("--note")
         .arg(&abs)
@@ -1343,12 +1443,37 @@ async fn generate_audio(
         .arg(&voice)
         .arg("--read-speaker")
         .arg(if read_speaker { "1" } else { "0" })
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
         .map_err(|e| format!("启动 python3 失败: {}(确认系统已装 edge-tts:pip install edge-tts)", e))?;
 
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-    let log = format!("{}\n{}", stdout, stderr);
+    let mut stdout_log = String::new();
+    if let Some(out) = child.stdout.take() {
+        for line in BufReader::new(out).lines() {
+            let line = match line {
+                Ok(l) => l,
+                Err(_) => break,
+            };
+            if let Some(rest) = line.strip_prefix("@PROGRESS ") {
+                let mut it = rest.split_whitespace();
+                if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                    if let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                        let _ = app.emit("precache-progress", PrecacheProgress { done, total });
+                    }
+                }
+                continue; // 进度行不进日志
+            }
+            stdout_log.push_str(&line);
+            stdout_log.push('\n');
+        }
+    }
+    let _ = child.wait();
+    let mut stderr = String::new();
+    if let Some(mut e) = child.stderr.take() {
+        let _ = e.read_to_string(&mut stderr);
+    }
+    let log = format!("{}\n{}", stdout_log, stderr);
 
     // 不再「一句失败就整篇报错」:脚本本身逐句容错、幂等续跑。
     // 以「磁盘上实际存在的音频」为准统计:成功的落盘保留,缺的下次点「生成」自动补齐。
@@ -1912,6 +2037,7 @@ pub fn run() {
             create_draft,
             save_raw,
             convert_note,
+            append_via_ai,
             optimize_sentence,
             apply_sentence_edit,
             generate_audio,
