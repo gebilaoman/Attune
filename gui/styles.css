@@ -380,8 +380,11 @@ html, body {
     font-size: 13px; line-height: 1.5;
 }
 .s-opt-preview.ok { color: var(--ok); font-size: 12px; padding: 4px 8px; }
-.s-opt-old { color: var(--text-3); text-decoration: line-through; text-decoration-color: var(--text-3); }
+/* 原句整行不再全删线:只给被 AI 改掉的词标红删除线、新句换上的词标绿,一眼锁定改动点 */
+.s-opt-old { color: var(--text-3); }
+.s-opt-old .diff-del { color: var(--danger); text-decoration: line-through; font-weight: 600; }
 .s-opt-new { color: var(--text-1); }
+.s-opt-new .diff-ins { color: var(--ok); font-weight: 600; background: rgba(46, 138, 91, 0.12); border-radius: 3px; padding: 0 2px; }
 .s-opt-old b, .s-opt-new b { font-style: normal; margin-right: 4px; color: var(--text-3); text-decoration: none; }
 .s-opt-zh { color: var(--text-2); font-size: 12px; margin-top: 2px; }
 .s-opt-note { color: var(--text-3); font-size: 11px; }

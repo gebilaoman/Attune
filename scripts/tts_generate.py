@@ -5,6 +5,7 @@
   - edge   : edge-tts(微软,免费,无需凭证;需 pip install edge-tts)
   - zhipu  : 智谱 GLM-TTS(POST /api/paas/v4/audio/speech,复用智谱 API Key)
   - doubao : 火山引擎(豆包)TTS(POST openspeech.bytedance.com/api/v1/tts,需 appid/token/cluster)
+  (macOS 系统音色 tts_provider=macos 由应用内 Rust 直连 say 合成,不经此脚本)
 
 为每个 read_aloud 的句生成一个 mp3,输出到 media/{note.id}/{音色}/序号.ext。
 按「文档 + 音色」分层:换音色 = 换子目录,互不覆盖,听读中途可随时切;每个音色各自缓存。
@@ -331,7 +332,10 @@ def main():
         print(f"[阿里云 NLS] voice={voice} region={region} speech_rate={aliyun_speech_rate(rate)}", flush=True)
         synth = lambda text, out: synth_aliyun(text, voice, rate, app_key, ak_id, ak_sec, region, out)
     else:
-        sys.stderr.write(f"未知 TTS 厂商: {provider}\n")
+        if provider == "macos":
+            sys.stderr.write("macOS 系统音色由应用内 Rust 直连 say 合成,不经此脚本。\n")
+        else:
+            sys.stderr.write(f"未知 TTS 厂商: {provider}\n")
         sys.exit(2)
 
     # 智谱 GLM-TTS 只出 wav;edge / 豆包 出 mp3

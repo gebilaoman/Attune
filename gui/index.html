@@ -190,6 +190,7 @@
                             <div class="model-control">
                                 <input type="text" id="vaultPath" placeholder="点击右侧选择文件夹…">
                                 <button id="pickVaultBtn" type="button">选择…</button>
+                                <button id="openVaultBtn" class="ghost-button sm" type="button" title="在 Finder 中打开库目录">↗ 打开目录</button>
                             </div>
                         </div>
                         <div class="form-group">
@@ -242,6 +243,7 @@
                             <label>TTS 厂商</label>
                             <select id="ttsProviderSel">
                                 <option value="edge">edge-tts(微软,免费,免配置)</option>
+                                <option value="macos">macOS 系统音色(离线,免配置)</option>
                                 <option value="zhipu">智谱 GLM-TTS</option>
                                 <!-- 火山/阿里云暂未调通,先禁用;调通后去掉 disabled 即可恢复 -->
                                 <option value="doubao" disabled>火山引擎(豆包)— 暂不可用</option>
@@ -259,10 +261,14 @@
                                 <input type="text" id="ttsVoiceAddName" placeholder="显示名(可空)">
                                 <button id="ttsVoiceAddBtn" class="ghost-button sm" type="button">＋ 添加</button>
                             </div>
+                            <div class="model-control tts-only tts-macos" style="margin-top:6px;">
+                                <button id="ttsScanVoicesBtn" class="ghost-button sm" type="button">⟳ 扫描系统音色</button>
+                                <span id="ttsScanStatus" class="field-note" style="flex:1;"></span>
+                            </div>
                             <p id="ttsVoiceHint" class="field-note"></p>
                         </div>
                         <div class="form-group">
-                            <label>语速(edge: -8%;智谱/豆包/阿里云也支持 -8% 或 0.92)</label>
+                            <label>语速(edge: -8%;智谱/豆包/阿里云/macOS 也支持 -8% 或 0.92)</label>
                             <input type="text" id="ttsRate" placeholder="-8%">
                         </div>
                         <div class="form-group">

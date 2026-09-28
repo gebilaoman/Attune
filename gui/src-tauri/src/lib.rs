@@ -185,10 +185,9 @@ fn provider_default_base_url(provider: &str) -> &'static str {
 }
 
 /// 首次使用时给各厂商 seed 一组默认音色(写入配置,用户随后可改)。
-fn seed_voices(config: &mut StoredConfig) {
-    if !config.tts.voices.is_empty() {
-        return;
-    }
+/// 按厂商补齐:已有该厂商列表的不动 —— 老配置升级后也能拿到新厂商(如 macos)的默认音色。
+/// 返回是否有新增(有则调用方落盘)。
+fn seed_voices(config: &mut StoredConfig) -> bool {
     let mut v: HashMap<String, Vec<[String; 2]>> = HashMap::new();
     v.insert(
         "edge".to_string(),
@@ -222,7 +221,24 @@ fn seed_voices(config: &mut StoredConfig) {
             ["ailun".into(), "艾伦(男)".into()],
         ],
     );
-    config.tts.voices = v;
+    // macOS 系统音色(say 命令,离线)。高级音色需先在系统设置下载(Read & Speak → Manage Voices)。
+    v.insert(
+        "macos".to_string(),
+        vec![
+            ["Ava (Premium)".into(), "Ava(美式女,Premium)".into()],
+            ["Samantha".into(), "Samantha(美式女,系统自带)".into()],
+            ["Daniel".into(), "Daniel(英式男,系统自带)".into()],
+            ["Karen".into(), "Karen(澳式女,系统自带)".into()],
+        ],
+    );
+    let mut changed = false;
+    for (p, list) in v {
+        if !config.tts.voices.contains_key(&p) {
+            config.tts.voices.insert(p, list);
+            changed = true;
+        }
+    }
+    changed
 }
 
 // ─────────────────────────── 对前端的公开视图 ───────────────────────────
@@ -348,9 +364,7 @@ fn load_config() -> StoredConfig {
                     if config.tts.rate.trim().is_empty() {
                         config.tts.rate = default_tts_rate();
                     }
-                    let voices_was_empty = config.tts.voices.is_empty();
-                    seed_voices(&mut config);
-                    if voices_was_empty {
+                    if seed_voices(&mut config) {
                         // 把 seed 的默认音色落盘,方便用户在 config.json 里直接增删
                         let _ = save_config(&config);
                     }
@@ -1341,29 +1355,36 @@ fn apply_sentence_edit(
     )
     .map_err(|e| format!("解析文档 JSON 失败: {}", e))?;
 
-    {
+    let was_read_aloud = {
         let s = locate_sentence_mut(&mut note, &sentence_id).ok_or("找不到该句")?;
         s.en = en.trim().to_string();
         s.zh = zh.trim().to_string();
-    }
-    write_private_json(&abs, &note)?;
+        s.read_aloud
+    };
 
-    // 该句文本变了 → 各音色的旧音频作废
+    // 该句文本变了 → 各音色的旧音频作废(mp3/wav/m4a)
     if let Some((note_id, seq)) = sentence_id.rsplit_once('_') {
         if let Ok(media_root) = vault_media_root(&config) {
             remove_sentence_audio(&media_root, note_id, seq);
         }
     }
+    // 该句音频已删 → 不再「全篇就绪」,与 save_blocks 同口径(侧栏角标显示「未缓存」)
+    if was_read_aloud {
+        note.audio_ready = false;
+    }
+    write_private_json(&abs, &note)?;
     Ok(())
 }
 
-/// 删除某句在所有音色子目录下的缓存音频(<vault>/media/{note_id}/*/{seq}.{mp3,wav})。
+/// 删除某句在所有音色子目录下的缓存音频(<vault>/media/{note_id}/*/{seq}.{mp3,wav,m4a})。
+/// 三种扩展名对应三家出片格式:edge=mp3、zhipu=wav、macos(say)=m4a,漏一种就会留旧录音
+/// (播放端缓存命中直接返回旧文件,文本改了声音不变)。
 fn remove_sentence_audio(media_root: &Path, note_id: &str, seq: &str) {
     let base = media_root.join(note_id);
     if let Ok(entries) = fs::read_dir(&base) {
         for e in entries.flatten() {
             if e.path().is_dir() {
-                for ext in ["mp3", "wav"] {
+                for ext in ["mp3", "wav", "m4a"] {
                     let _ = fs::remove_file(e.path().join(format!("{}.{}", seq, ext)));
                 }
             }
@@ -1405,8 +1426,9 @@ async fn generate_audio(
     use tauri::Emitter;
     let config = load_config();
     let abs = resolve_in_vault(&rel_path, &config)?;
+    // macOS 系统音色不依赖 python 脚本;其余厂商脚本必须存在。
     let script = tts_script_path();
-    if !script.exists() {
+    if config.tts.provider.trim() != "macos" && !script.exists() {
         return Err(format!("找不到 TTS 脚本: {}", script.display()));
     }
 
@@ -1429,51 +1451,56 @@ async fn generate_audio(
         }
     }
 
-    // 流式跑脚本:边跑边读 stdout,解析 `@PROGRESS done total` 转发前端(precache-progress),
-    // 其余行汇入日志。这样预缓存能实时显示「x/y 句」。
-    use std::io::{BufRead, BufReader, Read};
-    use std::process::Stdio;
-    let mut child = std::process::Command::new("python3")
-        .arg(script)
-        .arg("--note")
-        .arg(&abs)
-        .arg("--config")
-        .arg(get_config_path())
-        .arg("--voice")
-        .arg(&voice)
-        .arg("--read-speaker")
-        .arg(if read_speaker { "1" } else { "0" })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| format!("启动 python3 失败: {}(确认系统已装 edge-tts:pip install edge-tts)", e))?;
+    // macOS 系统音色:Rust 直连 say 逐句合成(离线);其余厂商走 python 脚本。
+    let log = if config.tts.provider.trim() == "macos" {
+        precache_via_say(&app, &abs, &config, &voice, read_speaker)?
+    } else {
+        // 流式跑脚本:边跑边读 stdout,解析 `@PROGRESS done total` 转发前端(precache-progress),
+        // 其余行汇入日志。这样预缓存能实时显示「x/y 句」。
+        use std::io::{BufRead, BufReader, Read};
+        use std::process::Stdio;
+        let mut child = std::process::Command::new("python3")
+            .arg(script)
+            .arg("--note")
+            .arg(&abs)
+            .arg("--config")
+            .arg(get_config_path())
+            .arg("--voice")
+            .arg(&voice)
+            .arg("--read-speaker")
+            .arg(if read_speaker { "1" } else { "0" })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("启动 python3 失败: {}(确认系统已装 edge-tts:pip install edge-tts)", e))?;
 
-    let mut stdout_log = String::new();
-    if let Some(out) = child.stdout.take() {
-        for line in BufReader::new(out).lines() {
-            let line = match line {
-                Ok(l) => l,
-                Err(_) => break,
-            };
-            if let Some(rest) = line.strip_prefix("@PROGRESS ") {
-                let mut it = rest.split_whitespace();
-                if let (Some(a), Some(b)) = (it.next(), it.next()) {
-                    if let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>()) {
-                        let _ = app.emit("precache-progress", PrecacheProgress { done, total });
+        let mut stdout_log = String::new();
+        if let Some(out) = child.stdout.take() {
+            for line in BufReader::new(out).lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => break,
+                };
+                if let Some(rest) = line.strip_prefix("@PROGRESS ") {
+                    let mut it = rest.split_whitespace();
+                    if let (Some(a), Some(b)) = (it.next(), it.next()) {
+                        if let (Ok(done), Ok(total)) = (a.parse::<usize>(), b.parse::<usize>()) {
+                            let _ = app.emit("precache-progress", PrecacheProgress { done, total });
+                        }
                     }
+                    continue; // 进度行不进日志
                 }
-                continue; // 进度行不进日志
+                stdout_log.push_str(&line);
+                stdout_log.push('\n');
             }
-            stdout_log.push_str(&line);
-            stdout_log.push('\n');
         }
-    }
-    let _ = child.wait();
-    let mut stderr = String::new();
-    if let Some(mut e) = child.stderr.take() {
-        let _ = e.read_to_string(&mut stderr);
-    }
-    let log = format!("{}\n{}", stdout_log, stderr);
+        let _ = child.wait();
+        let mut stderr = String::new();
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+        format!("{}\n{}", stdout_log, stderr)
+    };
 
     // 不再「一句失败就整篇报错」:脚本本身逐句容错、幂等续跑。
     // 以「磁盘上实际存在的音频」为准统计:成功的落盘保留,缺的下次点「生成」自动补齐。
@@ -1552,19 +1579,193 @@ fn cache_folder(voice: &str, read_speaker: bool) -> String {
     }
 }
 
+// ─────────────────────────── macOS 系统音色(say 命令,离线) ───────────────────────────
+// 与其它厂商不同:macOS 走 Rust 直连 `say`,完全不经 python(免冷启动、免网络、免凭证),
+// 实时单句 ~1s 内出 WAV。音色即系统音色名(如 "Ava (Premium)"),高级音色需先在
+// 系统设置 → 辅助功能 → Read & Speak → System Voice → Manage Voices 下载。
+
+/// `say` 默认语速(词/分钟),作为通用语速串("-8%"/"0.92")换算的基准。
+const SAY_BASE_WPM: f64 = 175.0;
+
+/// 把通用语速串换算成 say 的 wpm(与 Python parse_rate 同口径:百分比或倍数,夹在 0.5~2.0)。
+fn say_rate_wpm(rate: &str) -> u32 {
+    let r = rate.trim();
+    let mult = if let Some(pct) = r.strip_suffix('%') {
+        pct.parse::<f64>().map(|p| 1.0 + p / 100.0).unwrap_or(1.0)
+    } else {
+        r.parse::<f64>().unwrap_or(1.0)
+    };
+    (SAY_BASE_WPM * mult.clamp(0.5, 2.0)).round() as u32
+}
+
+/// 与 Python tts_text 同构:读名字时拼 "Speaker. 正文",否则只读正文。
+fn say_text(s: &Sentence, read_speaker: bool) -> String {
+    let speaker = s.speaker.trim();
+    let en = s.en.trim();
+    if read_speaker && !speaker.is_empty() {
+        format!("{}. {}", speaker, en)
+    } else {
+        en.to_string()
+    }
+}
+
+/// 用系统 say 合成一句到 out_path(**m4a/AAC 32kbps**,约为 wav 的 1/9、edge mp3 的 0.8)。
+/// say 不支持直接出压缩格式,故两步:wav 落临时文件 → `afconvert` 压成 m4a;两步各 ~0.1s 级。
+/// voice 传完整音色名(含质量后缀,如 "Ava (Premium)")。失败时清理半成品文件。
+fn synth_via_say(text: &str, voice: &str, wpm: u32, out_path: &Path) -> Result<(), String> {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let tmp_wav = std::env::temp_dir().join(format!(
+        "attune_say_{}_{}.wav",
+        std::process::id(),
+        nanos
+    ));
+
+    // 第一步:say 出 wav(22050Hz 单声道,音质基准)
+    let say_out = std::process::Command::new("say")
+        .arg("-v")
+        .arg(voice)
+        .arg("-r")
+        .arg(wpm.to_string())
+        .arg("-o")
+        .arg(&tmp_wav)
+        .arg("--file-format=WAVE")
+        .arg("--data-format=LEI16@22050")
+        .arg(text)
+        .output()
+        .map_err(|e| format!("启动 say 失败: {}", e))?;
+    let say_ok = say_out.status.success()
+        && fs::metadata(&tmp_wav).map(|m| m.len() > 0).unwrap_or(false);
+    if !say_ok {
+        let _ = fs::remove_file(&tmp_wav);
+        let stderr = String::from_utf8_lossy(&say_out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            format!("say 未产出音频(voice={})", voice)
+        } else {
+            stderr
+        });
+    }
+
+    // 第二步:afconvert 压成 m4a(系统自带;AAC 32kbps 单声道,听读足够)
+    let conv_out = std::process::Command::new("afconvert")
+        .arg("-f")
+        .arg("m4af")
+        .arg("-d")
+        .arg("aac")
+        .arg("-b")
+        .arg("32000")
+        .arg(&tmp_wav)
+        .arg(out_path)
+        .output()
+        .map_err(|e| {
+            let _ = fs::remove_file(&tmp_wav);
+            format!("启动 afconvert 失败: {}", e)
+        })?;
+    let _ = fs::remove_file(&tmp_wav);
+    let ok = conv_out.status.success()
+        && fs::metadata(out_path).map(|m| m.len() > 0).unwrap_or(false);
+    if !ok {
+        let _ = fs::remove_file(out_path);
+        let stderr = String::from_utf8_lossy(&conv_out.stderr).trim().to_string();
+        return Err(if stderr.is_empty() {
+            "afconvert 未产出音频".to_string()
+        } else {
+            stderr
+        });
+    }
+    Ok(())
+}
+
+/// 整篇预缓存(macOS 系统音色):Rust 直连 say 逐句合成(m4a),断点续跑(已存在非空即跳过),
+/// 逐句 emit `precache-progress`(与 python @PROGRESS 同语义),返回日志。
+/// audio 指针按「磁盘实际产出」写回 JSON,与 python 整篇模式口径一致。
+fn precache_via_say(
+    app: &tauri::AppHandle,
+    note_path: &Path,
+    config: &StoredConfig,
+    voice: &str,
+    read_speaker: bool,
+) -> Result<String, String> {
+    use tauri::Emitter;
+
+    let content = fs::read_to_string(note_path).map_err(|e| format!("读取文档失败: {}", e))?;
+    let mut note: Note =
+        serde_json::from_str(&content).map_err(|e| format!("解析文档 JSON 失败: {}", e))?;
+    let media_root = vault_media_root(config)?;
+    let vkey = cache_folder(voice, read_speaker);
+    let media_dir = media_root.join(&note.id).join(&vkey);
+    fs::create_dir_all(&media_dir).map_err(|e| format!("创建音频目录失败: {}", e))?;
+    let wpm = say_rate_wpm(&config.tts.rate);
+    let ext = tts_out_ext("macos");
+
+    // 进度分母 = 需音频的句(有 id、read_aloud、有正文),与 python 口径一致
+    let targets: Vec<(String, String)> = note
+        .collect_sentences()
+        .iter()
+        .filter(|s| !s.id.is_empty() && s.read_aloud && !say_text(s, read_speaker).is_empty())
+        .map(|s| (s.id.clone(), say_text(s, read_speaker)))
+        .collect();
+    let total = targets.len();
+    let mut done = 0usize;
+    let mut log = format!("[macOS say] voice={} rate={}wpm 共 {} 句\n", voice, wpm, total);
+
+    for (sid, text) in &targets {
+        let seq = sid.rsplit_once('_').map(|(_, s)| s).unwrap_or(sid.as_str());
+        let out = media_dir.join(format!("{}.{}", seq, ext));
+        if !fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false) {
+            if let Err(e) = synth_via_say(text, voice, wpm, &out) {
+                log.push_str(&format!("  ✗ {}: {}\n", sid, e));
+            }
+        }
+        done += 1; // 已处理 = 新生成 + 已存在 + 失败,与 python 一致
+        let _ = app.emit("precache-progress", PrecacheProgress { done, total });
+    }
+
+    // audio 指针只指向磁盘上真实存在的文件(失败的句保留旧值,下次点「生成」自动补齐)
+    let note_id = note.id.clone();
+    for s in note.sentences_mut() {
+        if s.id.is_empty() || !s.read_aloud || say_text(s, read_speaker).is_empty() {
+            continue;
+        }
+        let seq = s
+            .id
+            .rsplit_once('_')
+            .map(|(_, x)| x.to_string())
+            .unwrap_or_else(|| s.id.clone());
+        let out = media_dir.join(format!("{}.{}", &seq, ext));
+        if fs::metadata(&out).map(|m| m.len() > 0).unwrap_or(false) {
+            s.audio = format!("{}/{}/{}.{}", note_id, vkey, seq, ext);
+        }
+    }
+    write_private_json(note_path, &note)?;
+    log.push_str(&format!("完成:共 {} 句\n", total));
+    Ok(log)
+}
+
+/// 音频扩展名(缓存文件名与之配套):zhipu 出 wav,macos(say)出 m4a(AAC),其余出 mp3。
+fn tts_out_ext(provider: &str) -> &'static str {
+    match provider.trim() {
+        "zhipu" => "wav",
+        "macos" => "m4a",
+        _ => "mp3",
+    }
+}
+
 /// 读一个音频文件成 data URL(按扩展名给 mime;WKWebView 下用 data URL 规避自定义 scheme 的坑)。
 fn audio_file_to_data_url(path: &Path) -> Result<String, String> {
     let bytes = fs::read(path).map_err(|e| format!("读取音频失败({}): {}", path.display(), e))?;
     use base64_encode::encode;
-    let mime = if path
+    let mime = match path
         .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.eq_ignore_ascii_case("wav"))
-        .unwrap_or(false)
+        .map(|e| e.to_ascii_lowercase())
+        .as_deref()
     {
-        "audio/wav"
-    } else {
-        "audio/mpeg"
+        Some("wav") => "audio/wav",
+        Some("m4a") => "audio/mp4", // AAC;WKWebView 原生支持
+        _ => "audio/mpeg",
     };
     Ok(format!("data:{};base64,{}", mime, encode(&bytes)))
 }
@@ -1592,11 +1793,7 @@ async fn play_sentence(
         .unwrap_or_else(|| config.tts.voice.clone());
     let read_speaker = read_speaker.unwrap_or(config.tts.read_speaker);
     let folder = cache_folder(&voice, read_speaker);
-    let ext = if config.tts.provider.trim() == "zhipu" {
-        "wav"
-    } else {
-        "mp3"
-    };
+    let ext = tts_out_ext(&config.tts.provider);
     let cache = media
         .join(note_id)
         .join(&folder)
@@ -1607,7 +1804,29 @@ async fn play_sentence(
         return audio_file_to_data_url(&cache);
     }
 
-    // 未命中:实时合成(脚本 --only 覆盖当前音色 / 读名字设定),再读
+    // 未命中:macOS 系统音色走 Rust 直连 say(免 python 冷启动,~1s 出声),先读正文再合成。
+    if config.tts.provider.trim() == "macos" {
+        let note: Note = serde_json::from_str(
+            &fs::read_to_string(&abs).map_err(|e| format!("读取文档失败: {}", e))?,
+        )
+        .map_err(|e| format!("解析文档 JSON 失败: {}", e))?;
+        let sentences = note.collect_sentences();
+        let sentence = sentences
+            .iter()
+            .find(|s| s.id == sentence_id)
+            .ok_or_else(|| format!("找不到句 {}", sentence_id))?;
+        let text = say_text(sentence, read_speaker);
+        if text.is_empty() {
+            return Err(format!("句 {} 无可朗读正文", sentence_id));
+        }
+        if let Some(parent) = cache.parent() {
+            fs::create_dir_all(parent).map_err(|e| format!("创建缓存目录失败: {}", e))?;
+        }
+        synth_via_say(&text, &voice, say_rate_wpm(&config.tts.rate), &cache)?;
+        return audio_file_to_data_url(&cache);
+    }
+
+    // 未命中:其余厂商实时合成(脚本 --only 覆盖当前音色 / 读名字设定),再读
     let script = tts_script_path();
     if !script.exists() {
         return Err(format!("找不到 TTS 脚本: {}", script.display()));
@@ -1644,6 +1863,27 @@ async fn play_sentence(
 /// 试听:用已保存的 config(厂商/音色/凭证)合成一句样本,返回 data URL 供前端播放。
 #[tauri::command]
 async fn test_tts() -> Result<String, String> {
+    // macOS 系统音色:Rust 直连 say,不经 python。
+    let config = load_config();
+    if config.tts.provider.trim() == "macos" {
+        let voice = {
+            let v = config.tts.voice.trim();
+            if v.is_empty() { "Samantha" } else { v }
+        };
+        let out = std::env::temp_dir().join("attune_tts_test.m4a");
+        synth_via_say(
+            "Hello. This is a quick voice test. One, two, three.",
+            voice,
+            say_rate_wpm(&config.tts.rate),
+            &out,
+        )
+        .map_err(|e| format!("试听失败:\n{}", e))?;
+        let bytes =
+            fs::read(&out).map_err(|e| format!("读取试听音频失败({}): {}", out.display(), e))?;
+        use base64_encode::encode;
+        return Ok(format!("data:audio/mp4;base64,{}", encode(&bytes)));
+    }
+
     let script = tts_script_path();
     if !script.exists() {
         return Err(format!("找不到 TTS 脚本: {}", script.display()));
@@ -1688,6 +1928,83 @@ async fn test_tts() -> Result<String, String> {
         "audio/mpeg"
     };
     Ok(format!("data:{};base64,{}", mime, encode(&bytes)))
+}
+
+/// 列出本机 macOS 系统英文音色(`say -v '?'`),供设置页「扫描系统音色」。
+/// 只返回英文(en_*),滤掉娱乐/搞怪音色,Premium/Enhanced 排前。形状与 config.tts.voices 一致。
+#[tauri::command]
+fn list_system_voices() -> Result<Vec<[String; 2]>, String> {
+    let output = std::process::Command::new("say")
+        .arg("-v")
+        .arg("?")
+        .output()
+        .map_err(|e| format!("执行 say 失败: {}", e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "say -v '?' 失败: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(parse_say_voices(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// 解析 `say -v '?'` 输出 → 英文音色 [[id, 显示名], ...](Premium → Enhanced → 普通 排序)。
+fn parse_say_voices(text: &str) -> Vec<[String; 2]> {
+    // 娱乐/搞怪音色(老 MacinTalk 遗产 + 新奇系列),精听场景没用,直接滤掉。
+    // (Eddy/Flo/Grandma 等会带 "(English (US))" 后缀,故按根名匹配。)
+    const NOVELTY: [&str; 27] = [
+        "Albert", "Bad News", "Bahh", "Bells", "Boing", "Bubbles", "Cellos", "Eddy", "Flo",
+        "Fred", "Good News", "Grandma", "Grandpa", "Jester", "Junior", "Kathy", "Organ",
+        "Ralph", "Reed", "Rocko", "Sandy", "Shelley", "Superstar", "Trinoids", "Whisper",
+        "Wobble", "Zarvox",
+    ];
+
+    // (排序键:质量, 音色名, [id, 显示名]) —— id 用完整名(含质量后缀),即传给 say -v 的值。
+    let mut list: Vec<(u8, String, [String; 2])> = Vec::new();
+    for line in text.lines() {
+        // 行格式:`Ava (Premium)      en_US    # Hello! My name is Ava.`
+        let left = line.split('#').next().unwrap_or("").trim_end();
+        let Some((name, locale)) = left.rsplit_once(' ').map(|(n, l)| (n.trim_end(), l.trim()))
+        else {
+            continue;
+        };
+        // locale 形如 en_US(音色名自身可含空格,故从右侧截取)
+        if !(locale.len() == 5 && locale.starts_with("en_")) {
+            continue;
+        }
+        let base = name
+            .strip_suffix(" (Premium)")
+            .or_else(|| name.strip_suffix(" (Enhanced)"))
+            .unwrap_or(name);
+        let root = base.split(" (").next().unwrap_or(base);
+        if NOVELTY.contains(&root) {
+            continue;
+        }
+        let (rank, quality) = if name.ends_with("(Premium)") {
+            (0u8, "Premium")
+        } else if name.ends_with("(Enhanced)") {
+            (1u8, "Enhanced")
+        } else {
+            (2u8, "")
+        };
+        let variant = match locale {
+            "en_US" => "美式",
+            "en_GB" => "英式",
+            "en_AU" => "澳式",
+            "en_IE" => "爱尔兰",
+            "en_IN" => "印度",
+            "en_ZA" => "南非",
+            _ => locale,
+        };
+        let label = if quality.is_empty() {
+            format!("{}({})", base, variant)
+        } else {
+            format!("{}({},{})", base, variant, quality)
+        };
+        list.push((rank, name.to_string(), [name.to_string(), label]));
+    }
+    list.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    list.into_iter().map(|(_, _, pair)| pair).collect()
 }
 
 /// 把一个句级 mp3 读成 data URL 供前端 <audio> 播放。
@@ -1875,7 +2192,7 @@ fn save_config_command(input: ConfigInput) -> Result<PublicConfig, String> {
     if let Some(t) = input.tts {
         if let Some(p) = t.provider {
             let p = p.trim().to_string();
-            if matches!(p.as_str(), "edge" | "zhipu" | "doubao" | "aliyun") {
+            if matches!(p.as_str(), "edge" | "macos" | "zhipu" | "doubao" | "aliyun") {
                 stored.tts.provider = p;
             }
         }
@@ -2043,6 +2360,7 @@ pub fn run() {
             generate_audio,
             play_sentence,
             test_tts,
+            list_system_voices,
             load_audio_data,
             fetch_models,
             open_data_directory,
@@ -2156,5 +2474,90 @@ mod tests {
     fn strips_code_fence_helper() {
         assert_eq!(strip_code_fence("```json\n{}\n```"), "{}");
         assert_eq!(strip_code_fence("{\"a\":1}"), "{\"a\":1}");
+    }
+
+    /// macOS say:语速换算与朗读文本拼装(须与 Python parse_rate / tts_text 同口径)。
+    #[test]
+    fn say_rate_and_text_helpers() {
+        // 各厂商缓存扩展名:macos 出 m4a(AAC)、zhipu 出 wav、其余 mp3
+        assert_eq!(tts_out_ext("macos"), "m4a");
+        assert_eq!(tts_out_ext("zhipu"), "wav");
+        assert_eq!(tts_out_ext("edge"), "mp3");
+
+        assert_eq!(say_rate_wpm("-8%"), 161); // 175 × 0.92
+        assert_eq!(say_rate_wpm("0.92"), 161);
+        assert_eq!(say_rate_wpm(""), 175); // 空/非法 → say 默认
+        assert_eq!(say_rate_wpm("abc"), 175);
+        assert_eq!(say_rate_wpm("10%"), 193); // 175 × 1.1 → 192.5 四舍五入
+        assert_eq!(say_rate_wpm("50%"), 263); // 175 × 1.5 → 262.5 四舍五入
+        assert_eq!(say_rate_wpm("150%"), 350); // 夹上限 2.0 → 175 × 2
+        assert_eq!(say_rate_wpm("-80%"), 88); // 夹下限 0.5 → 175 × 0.5
+
+        let mut s = Sentence {
+            id: String::new(),
+            speaker: "Dan".into(),
+            en: "Sounds good.".into(),
+            zh: String::new(),
+            audio: String::new(),
+            read_aloud: true,
+            mastered: false,
+        };
+        assert_eq!(say_text(&s, true), "Dan. Sounds good.");
+        assert_eq!(say_text(&s, false), "Sounds good.");
+        s.speaker = "  ".into();
+        assert_eq!(say_text(&s, true), "Sounds good."); // 空白名字不拼前缀
+    }
+
+    /// `say -v '?'` 输出解析:英文过滤、娱乐音色过滤、质量排序(用真实机器上的行格式样本)。
+    #[test]
+    fn parses_say_voice_listing() {
+        let raw = "Ava (Premium)       en_US    # Hello! My name is Ava.\n\
+                   Samantha            en_US    # Hello! My name is Samantha.\n\
+                   Daniel              en_GB    # Hello! My name is Daniel.\n\
+                   Karen               en_AU    # Hello! My name is Karen.\n\
+                   Eddy (English (US)) en_US    # Hello! My name is Eddy.\n\
+                   Zarvox              en_US    # Hello! My name is Zarvox.\n\
+                   Ting-Ting           zh_CN    # 你好,我叫婷婷。\n\
+                   Milena              pt_BR    # Olá, meu nome é Milena.\n";
+        let list = parse_say_voices(raw);
+        assert_eq!(list.len(), 4, "英文 + 非娱乐,应剩 4 个: {:?}", list);
+        // Premium 排最前;id 保留完整名(含质量后缀,即 say -v 的取值)
+        assert_eq!(list[0][0], "Ava (Premium)");
+        assert_eq!(list[0][1], "Ava(美式,Premium)");
+        // 其余按名字排序;中文/葡语/娱乐音色被滤掉
+        assert_eq!(list[1][0], "Daniel");
+        assert_eq!(list[1][1], "Daniel(英式)");
+        assert_eq!(list[2][0], "Karen");
+        assert_eq!(list[3][0], "Samantha");
+    }
+
+    /// 改句作废音频:mp3 / wav / m4a(edge / zhipu / macos 三家缓存)必须全删,
+    /// 漏一种 → 播放端缓存命中返回旧录音(AI 优化后声音还是旧文本,即「播不了新句」bug)。
+    #[test]
+    fn remove_sentence_audio_covers_all_exts() {
+        let root = std::env::temp_dir().join(format!("attune_rm_test_{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        // 两个音色目录,各放齐三种扩展名 + 一个不该被删的别的序号
+        for voice_dir in ["Ava__Premium_", "en-US-AriaNeural"] {
+            let dir = root.join("note_x").join(voice_dir);
+            fs::create_dir_all(&dir).unwrap();
+            for ext in ["mp3", "wav", "m4a"] {
+                fs::write(dir.join(format!("3.{}", ext)), b"x").unwrap();
+            }
+            fs::write(dir.join("4.m4a"), b"x").unwrap();
+        }
+        remove_sentence_audio(&root, "note_x", "3");
+        for voice_dir in ["Ava__Premium_", "en-US-AriaNeural"] {
+            let dir = root.join("note_x").join(voice_dir);
+            for ext in ["mp3", "wav", "m4a"] {
+                assert!(
+                    !dir.join(format!("3.{}", ext)).exists(),
+                    "3.{} 应被删除",
+                    ext
+                );
+            }
+            assert!(dir.join("4.m4a").exists(), "别的序号不应被误删");
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 }

@@ -118,6 +118,7 @@ async function init() {
 let ttsVoices = {};
 const TTS_VOICE_HINTS = {
     edge: 'edge-tts 音色;需要更多点下方「＋ 添加」',
+    macos: 'macOS 系统音色,离线免配置;高质量音色先在 系统设置→辅助功能→Read & Speak→System Voice→Manage Voices 下载,再点「扫描系统音色」',
     zhipu: '智谱 GLM-TTS;文档公开音色暂仅 female(彤彤),可自行追加',
     doubao: '火山 voice_type;豆包音色很多,按需「＋ 添加」(如 en_ 或 BV 前缀)',
     aliyun: '阿里云 NLS 发音人(如 xiaoyun / ailun);可自行追加',
@@ -126,6 +127,7 @@ const TTS_VOICE_HINTS = {
 function applyConfigToUI(cfg) {
     $('vaultLabel').textContent = cfg.vault_path ? cfg.vault_path.split('/').pop() : '未选择库';
     $('vaultPath').value = cfg.vault_path || '';
+    $('openVaultBtn').disabled = !cfg.vault_path; // 未选库时禁用「打开目录」
     $('providerSel').value = cfg.provider;
     $('baseUrlInput').value = cfg.base_url;
     setModelOptions(cfg.model ? [cfg.model] : [], cfg.model);
@@ -180,6 +182,7 @@ function setTtsProviderUI(provider, savedVoice) {
     if (provider === 'zhipu') document.querySelectorAll('.tts-zhipu').forEach((el) => { el.style.display = ''; });
     if (provider === 'doubao') document.querySelectorAll('.tts-doubao').forEach((el) => { el.style.display = ''; });
     if (provider === 'aliyun') document.querySelectorAll('.tts-aliyun').forEach((el) => { el.style.display = ''; });
+    if (provider === 'macos') document.querySelectorAll('.tts-macos').forEach((el) => { el.style.display = ''; });
     $('ttsVoiceHint').textContent = TTS_VOICE_HINTS[provider] || '';
     populateTtsVoices(provider, savedVoice);
 }
@@ -203,6 +206,31 @@ async function delTtsVoice() {
     if (!(await confirmDialog(`删除音色「${cur}」?`, { okText: '删除', danger: true }))) return;
     ttsVoices[p] = (ttsVoices[p] || []).filter(([v]) => v !== cur);
     populateTtsVoices(p, (ttsVoices[p][0] && ttsVoices[p][0][0]) || '');
+}
+
+// 扫描本机 macOS 系统英文音色(后端解析 `say -v '?'`),替换 ttsVoices.macos;
+// 需先保存设置才写入 config.json。当前选中项若还在则保持。
+async function scanSystemVoices() {
+    const btn = $('ttsScanVoicesBtn');
+    const status = $('ttsScanStatus');
+    btn.disabled = true;
+    status.textContent = '扫描中…';
+    try {
+        const list = await invoke('list_system_voices');
+        if (!list.length) {
+            status.textContent = '没扫到英文系统音色';
+            return;
+        }
+        ttsVoices['macos'] = list;
+        const cur = $('ttsVoice').value;
+        const keep = list.some(([id]) => id === cur) ? cur : list[0][0];
+        populateTtsVoices('macos', keep);
+        status.textContent = `扫到 ${list.length} 个英文音色(Premium 优先);保存设置后生效`;
+    } catch (e) {
+        status.textContent = `扫描失败: ${e}`;
+    } finally {
+        btn.disabled = false;
+    }
 }
 
 function shortenPath(p) {
@@ -677,14 +705,43 @@ async function optimizeSentence(s, row, btn) {
     }
 }
 
+// 词级 diff 高亮:把「原/新」英文按空白切成 token,用最长公共子序列(LCS)对齐。
+// 原句被改掉的词 → .diff-del(红 + 删除线),新句换上的词 → .diff-ins(绿)。
+// 一眼看出 AI 到底动了哪几个词。返回 [oldHtml, newHtml];句长几十词内,O(n·m) 足够快。
+function wordDiffMarkup(oldText, newText) {
+    const a = String(oldText || '').split(/(\s+)/).filter((t) => t !== '');
+    const b = String(newText || '').split(/(\s+)/).filter((t) => t !== '');
+    const n = a.length, m = b.length;
+    // lcs[i][j] = a[i..] 与 b[j..] 的最长公共子序列长度(倒序填表,便于回溯)
+    const lcs = Array.from({ length: n + 1 }, () => new Uint32Array(m + 1));
+    for (let i = n - 1; i >= 0; i--) {
+        for (let j = m - 1; j >= 0; j--) {
+            lcs[i][j] = a[i] === b[j]
+                ? lcs[i + 1][j + 1] + 1
+                : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
+        }
+    }
+    // 回溯:公共 token 原样输出;只在差异处打标记
+    let oh = '', nh = '', i = 0, j = 0;
+    while (i < n && j < m) {
+        if (a[i] === b[j]) { oh += esc(a[i]); nh += esc(b[j]); i++; j++; }
+        else if (lcs[i + 1][j] >= lcs[i][j + 1]) { oh += `<span class="diff-del">${esc(a[i])}</span>`; i++; }
+        else { nh += `<span class="diff-ins">${esc(b[j])}</span>`; j++; }
+    }
+    while (i < n) { oh += `<span class="diff-del">${esc(a[i++])}</span>`; }
+    while (j < m) { nh += `<span class="diff-ins">${esc(b[j++])}</span>`; }
+    return [oh, nh];
+}
+
 // 渲染/刷新优化预览面板。res=当前建议;prefillHint=回填上次输入的提示,便于继续微调。
 function showOptPreview(s, row, res, prefillHint) {
     const body = row.querySelector('.s-body');
     body.querySelector('.s-opt-preview')?.remove();
 
+    const [oldHtml, newHtml] = wordDiffMarkup(s.en, res.en); // 词级高亮:红删/绿增
     const box = el('div', 's-opt-preview');
-    const oldLine = el('div', 's-opt-old'); oldLine.innerHTML = `<b>原</b> ${esc(s.en)}`;
-    const newLine = el('div', 's-opt-new'); newLine.innerHTML = `<b>新</b> ${esc(res.en)}`;
+    const oldLine = el('div', 's-opt-old'); oldLine.innerHTML = `<b>原</b> ${oldHtml}`;
+    const newLine = el('div', 's-opt-new'); newLine.innerHTML = `<b>新</b> ${newHtml}`;
     const zhLine = el('div', 's-opt-zh', res.zh || '');
     if (!res.changed) newLine.innerHTML += ' <span class="s-opt-note">(AI 认为无需改动,可在下方补充提示重试)</span>';
 
@@ -1201,6 +1258,7 @@ function bindSettings() {
     $('ttsProviderSel').onchange = () => setTtsProviderUI($('ttsProviderSel').value);
     $('ttsVoiceAddBtn').onclick = addTtsVoice;
     $('ttsVoiceDelBtn').onclick = delTtsVoice;
+    $('ttsScanVoicesBtn').onclick = scanSystemVoices;
     $('testTtsBtn').onclick = testTts;
     $('fetchModelsBtn').onclick = fetchModels;
     $('openDataDirBtn').onclick = openDataDirectory;
