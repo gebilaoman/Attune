@@ -1376,6 +1376,50 @@ fn apply_sentence_edit(
     Ok(())
 }
 
+/// 单句补翻译:译文为空时点「译」触发。只写该句 zh 落盘,英文不变 → 音频不作废。
+#[tauri::command]
+async fn translate_sentence(rel_path: String, sentence_id: String) -> Result<String, String> {
+    let config = load_config();
+    let abs = resolve_in_vault(&rel_path, &config)?;
+    let mut note: Note = serde_json::from_str(
+        &fs::read_to_string(&abs).map_err(|e| format!("读取文档失败: {}", e))?,
+    )
+    .map_err(|e| format!("解析文档 JSON 失败: {}", e))?;
+
+    let (en, prev, next) = {
+        let sentences = note.collect_sentences();
+        let idx = sentences
+            .iter()
+            .position(|s| s.id == sentence_id)
+            .ok_or("找不到该句")?;
+        (
+            sentences[idx].en.clone(),
+            idx.checked_sub(1).map(|i| sentences[i].en.clone()).unwrap_or_default(),
+            sentences.get(idx + 1).map(|s| s.en.clone()).unwrap_or_default(),
+        )
+    };
+    if en.trim().is_empty() {
+        return Err("该句没有英文,无法翻译".into());
+    }
+
+    let provider = build_provider(&config)?;
+    let prompt = format!(
+        "把下面这句英文翻译成通顺准确的中文。只输出中文译文本身,不要引号、不要解释。\n\
+         上下文仅供理解歧义,不要翻译进去:\n上一句: {prev}\n下一句: {next}\n\n需要翻译的句子:\n{en}"
+    );
+    let resp = provider.ask_raw(&prompt).await?;
+    let zh = strip_code_fence(&resp).trim().to_string();
+    if zh.is_empty() {
+        return Err("AI 未返回译文".into());
+    }
+
+    locate_sentence_mut(&mut note, &sentence_id)
+        .ok_or("找不到该句")?
+        .zh = zh.clone();
+    write_private_json(&abs, &note)?;
+    Ok(zh)
+}
+
 /// 删除某句在所有音色子目录下的缓存音频(<vault>/media/{note_id}/*/{seq}.{mp3,wav,m4a})。
 /// 三种扩展名对应三家出片格式:edge=mp3、zhipu=wav、macos(say)=m4a,漏一种就会留旧录音
 /// (播放端缓存命中直接返回旧文件,文本改了声音不变)。
@@ -2357,6 +2401,7 @@ pub fn run() {
             append_via_ai,
             optimize_sentence,
             apply_sentence_edit,
+            translate_sentence,
             generate_audio,
             play_sentence,
             test_tts,

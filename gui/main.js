@@ -673,7 +673,25 @@ function renderSentence(s) {
 
     const tools = el('div', 's-tools');
     const zhBtn = el('button', 's-tool' + (row.classList.contains('show-zh') ? ' on' : ''), '译');
-    zhBtn.onclick = (e) => { e.stopPropagation(); row.classList.toggle('show-zh'); zhBtn.classList.toggle('on'); };
+    zhBtn.onclick = async (e) => {
+        e.stopPropagation();
+        if (zhBtn.disabled) return;
+        const opening = !row.classList.contains('show-zh');
+        // 没译文 → 打开时先 AI 补翻译(落盘,不动音频)
+        if (opening && !(s.zh || '').trim()) {
+            zhBtn.disabled = true; zhBtn.textContent = '翻译中…';
+            try {
+                s.zh = await invoke('translate_sentence', { relPath: state.noteRel, sentenceId: s.id });
+                zh.textContent = s.zh;
+            } catch (err) {
+                alert('翻译失败:' + err);
+                return;
+            } finally {
+                zhBtn.disabled = false; zhBtn.textContent = '译';
+            }
+        }
+        row.classList.toggle('show-zh'); zhBtn.classList.toggle('on');
+    };
     const optBtn = el('button', 's-tool', 'AI优化');
     optBtn.title = '用 AI 校对转写错误(如 Web View→WebView),预览后再采纳';
     optBtn.onclick = (e) => { e.stopPropagation(); optimizeSentence(s, row, optBtn); };
