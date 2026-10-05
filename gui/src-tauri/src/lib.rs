@@ -2177,12 +2177,41 @@ async fn lookup_word(word: String, context: String) -> Result<String, String> {
     let prompt = format!(
         "你在帮一个英语学习者「即查单词」。请结合下面的【句子上下文】,用中文解释「{word}」在这句话里的含义。\n\
          要求:\n\
-         - 第一行:这个词最核心的中文释义。\n\
-         - 第二行起:它在这句话里的具体意思(解决一词多义 / 行话,例如 cut 在 \"cut a 1.0.1 release\" 里是「发布/打版本」而不是「切」),并简要点一下常见用法或搭配。\n\
-         - 简短,3~6 行以内,不要长篇大论。\n\n\
+         - 第一行:只输出它的美式音标,用斜杠包住,如 /ˈsʌmθɪŋ/,不要别的字。\n\
+         - 第二行:这个词最核心的中文释义。\n\
+         - 第三行起:它在这句话里的具体意思(解决一词多义 / 行话,例如 cut 在 \"cut a 1.0.1 release\" 里是「发布/打版本」而不是「切」),并简要点一下常见用法或搭配。\n\
+         - 简短,4~7 行以内,不要长篇大论。\n\n\
          句子上下文:{context}"
     );
     provider.ask_raw(&prompt).await
+}
+
+/// 即查发音:系统 `say` 直接外放(离线、~0.3s,不落盘)。
+/// 当前厂商是 macos 时用前端传来的音色(与正文一致);其它厂商用系统自带英文音色 Samantha
+///(不能用系统默认音色:中文系统下会是中文音色)。指定音色不可用时退回 Samantha。
+#[tauri::command]
+async fn speak_word(word: String, voice: Option<String>) -> Result<(), String> {
+    let config = load_config();
+    let wpm = say_rate_wpm(&config.tts.rate);
+    let voice = voice
+        .filter(|v| config.tts.provider.trim() == "macos" && !v.trim().is_empty())
+        .unwrap_or_else(|| "Samantha".to_string());
+    tokio::task::spawn_blocking(move || {
+        let run = |v: &str| {
+            std::process::Command::new("say")
+                .args(["-v", v, "-r", &wpm.to_string(), &word])
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        };
+        if run(&voice) || (voice != "Samantha" && run("Samantha")) {
+            Ok(())
+        } else {
+            Err("发音失败:系统 say 不可用".to_string())
+        }
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 // ─────────────────────────── 配置 / 文件夹命令 ───────────────────────────
@@ -2413,6 +2442,7 @@ pub fn run() {
             fetch_models,
             open_data_directory,
             lookup_word,
+            speak_word,
             start_window_drag,
             update::get_app_version,
             update::get_system_info

@@ -1576,7 +1576,9 @@ async function showWordPopover(wordEl, sentence) {
     const word = wordEl.dataset.word;
     const pop = $('wordPopover');
     $('wordTitle').textContent = word;
+    $('wordIpa').textContent = '';
     $('wordBody').textContent = '查询中…';
+    $('wordSpeak').onclick = (e) => { e.stopPropagation(); speakWord(word); };
     pop.hidden = false;
     // 定位
     const r = wordEl.getBoundingClientRect();
@@ -1587,9 +1589,31 @@ async function showWordPopover(wordEl, sentence) {
     pop.style.top = (r.bottom + 8) + 'px';
     try {
         const ans = await invoke('lookup_word', { word, context: sentence.en });
-        $('wordBody').textContent = ans;
+        if ($('wordTitle').textContent !== word) return; // 期间已点了别的词
+        // 首行是音标(/…/ 或 […])→ 放到标题旁,正文去掉这行
+        const lines = ans.trim().split('\n');
+        const first = (lines[0] || '').trim();
+        if (/^[\/\[].+[\/\]]$/.test(first)) {
+            $('wordIpa').textContent = first;
+            lines.shift();
+        }
+        $('wordBody').textContent = lines.join('\n').trim();
     } catch (e) {
         $('wordBody').textContent = '查询失败:' + e;
+    }
+}
+
+// 即查发音:后端系统 say 直接外放;macos 厂商时用当前正文音色。发音期间按钮高亮,忽略重复点击。
+async function speakWord(word) {
+    const btn = $('wordSpeak');
+    if (btn.classList.contains('speaking')) return;
+    btn.classList.add('speaking');
+    try {
+        await invoke('speak_word', { word, voice: state.currentVoice || state.config?.tts?.voice || null });
+    } catch (e) {
+        $('wordBody').textContent += '\n(' + e + ')';
+    } finally {
+        btn.classList.remove('speaking');
     }
 }
 function hideWordPopover() { $('wordPopover').hidden = true; }

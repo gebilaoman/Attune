@@ -645,7 +645,9 @@ input[type="checkbox"] { accent-color: var(--brand); width: auto; }
     padding: 14px 16px;
 }
 .word-popover-head { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; padding-bottom: 10px; border-bottom: 1px solid var(--line); }
-.word-popover-head strong { flex: 1; font-size: 17px; color: var(--brand); font-family: var(--serif); }
+.word-popover-head strong { font-size: 17px; color: var(--brand); font-family: var(--serif); }
+.word-ipa { flex: 1; font-size: 13px; color: var(--text-2); font-family: "Lucida Grande", "Arial Unicode MS", sans-serif; }
+.word-speak.speaking { color: var(--brand); }
 .word-star { color: var(--text-3); cursor: pointer; font-size: 16px; }
 .word-star:hover { color: #d4a93a; }
 .word-popover-body { font-size: 13.5px; line-height: 1.7; color: var(--text); white-space: pre-wrap; user-select: text; }
