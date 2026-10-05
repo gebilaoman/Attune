@@ -1381,10 +1381,11 @@ fn apply_sentence_edit(
 async fn translate_sentence(rel_path: String, sentence_id: String) -> Result<String, String> {
     let config = load_config();
     let abs = resolve_in_vault(&rel_path, &config)?;
-    let mut note: Note = serde_json::from_str(
-        &fs::read_to_string(&abs).map_err(|e| format!("读取文档失败: {}", e))?,
-    )
-    .map_err(|e| format!("解析文档 JSON 失败: {}", e))?;
+    let read_note = || -> Result<Note, String> {
+        serde_json::from_str(&fs::read_to_string(&abs).map_err(|e| format!("读取文档失败: {}", e))?)
+            .map_err(|e| format!("解析文档 JSON 失败: {}", e))
+    };
+    let note = read_note()?;
 
     let (en, prev, next) = {
         let sentences = note.collect_sentences();
@@ -1413,6 +1414,8 @@ async fn translate_sentence(rel_path: String, sentence_id: String) -> Result<Str
         return Err("AI 未返回译文".into());
     }
 
+    // AI 请求要几秒,期间用户可能改了文档(如点「懂了」)→ 落盘前重读最新版,只改这一句 zh,避免覆盖
+    let mut note = read_note()?;
     locate_sentence_mut(&mut note, &sentence_id)
         .ok_or("找不到该句")?
         .zh = zh.clone();

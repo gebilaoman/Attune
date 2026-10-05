@@ -82,6 +82,8 @@ const state = {
     readSpeaker: true,    // 是否读说话人姓名(热开关);默认跟随 config
     audioCache: new Map(),// `${voice}:${readSpeaker}:${sentenceId}` -> dataURL
     audioInflight: new Map(), // 同键在途的合成 Promise:多次点击/预取复用一个,不重复起进程
+    zhInflight: new Map(),    // 句 id -> 在途的补翻译 Promise(去重)
+    zhChain: Promise.resolve(), // 补翻译串行队列:后端整篇读改写 JSON,并发会互相覆盖
     // 编辑
     forceRaw: false,      // 已转化文档里点「回原文重转」时为 true,强制原文 textarea
     structMode: false,    // 当前是否在句块就地编辑
@@ -677,12 +679,11 @@ function renderSentence(s) {
         e.stopPropagation();
         if (zhBtn.disabled) return;
         const opening = !row.classList.contains('show-zh');
-        // 没译文 → 打开时先 AI 补翻译(落盘,不动音频)
+        // 没译文 → 打开时先 AI 补翻译(落盘,不动音频);预翻译已在途则直接复用
         if (opening && !(s.zh || '').trim()) {
             zhBtn.disabled = true; zhBtn.textContent = '翻译中…';
             try {
-                s.zh = await invoke('translate_sentence', { relPath: state.noteRel, sentenceId: s.id });
-                zh.textContent = s.zh;
+                await ensureZh(s, { force: true });
             } catch (err) {
                 alert('翻译失败:' + err);
                 return;
@@ -895,6 +896,7 @@ async function playIndex(i) {
     const s = state.queue[i];
     highlightSentence(s.id);
     setNowPlayingFromSentence(s);
+    prefetchZh();
 
     if (!s.read_aloud) {
         // 不朗读(占位符/链接等):直接跳下一句
@@ -991,6 +993,47 @@ function preloadNext() {
         if (!state.audioCache.has(key) && !state.audioInflight.has(key)) {
             ensureAudio(nx).catch(() => {});
         }
+    }
+}
+
+// ─────────────────────── 补翻译队列 ───────────────────────
+
+// 取某句译文:已有直接返回;否则排进串行队列调 translate_sentence(后端落盘)。
+// force=false(预翻译)时,排到时文档已切走就跳过,不为旧文档白跑 AI。
+function ensureZh(s, opts = {}) {
+    if ((s.zh || '').trim()) return Promise.resolve(s.zh);
+    if (state.zhInflight.has(s.id)) return state.zhInflight.get(s.id);
+    const rel = state.noteRel;
+    const p = state.zhChain.then(async () => {
+        if ((s.zh || '').trim()) return s.zh;
+        if (!opts.force && rel !== state.noteRel) throw new Error('文档已切换');
+        const zh = await invoke('translate_sentence', { relPath: rel, sentenceId: s.id });
+        s.zh = zh;
+        refreshZhUI(s);
+        return zh;
+    }).finally(() => state.zhInflight.delete(s.id));
+    state.zhChain = p.catch(() => {});
+    state.zhInflight.set(s.id, p);
+    return p;
+}
+
+// 译文到了:刷新句行的 .zh;若正是当前播放句,刷新左下角(合成中时由 setSynthing 自带文案)。
+function refreshZhUI(s) {
+    const row = document.querySelector(`.sentence[data-id="${cssEscape(s.id)}"]`);
+    const zhEl = row?.querySelector('.zh');
+    if (zhEl) zhEl.textContent = s.zh;
+    const cur = state.queue[state.qIndex];
+    if (cur && cur.id === s.id && !state.synthing) setNowPlayingFromSentence(s);
+}
+
+// 预翻译深度:播放时把当前句 + 后面几句里没译文的排进队列,读到时译文已就绪。
+const ZH_PREFETCH_AHEAD = 5;
+function prefetchZh() {
+    for (let k = 0; k <= ZH_PREFETCH_AHEAD; k++) {
+        const s = state.queue[state.qIndex + k];
+        if (!s) break;
+        if (!s.read_aloud || !(s.en || '').trim()) continue;
+        ensureZh(s).catch(() => {});
     }
 }
 
